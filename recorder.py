@@ -86,50 +86,41 @@ def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
                         return {"ok": False, "room_status": room_status}
                     continue
 
-                # Fetch master playlist once to extract session-bound video + audio chunklists
-                r_pl = s.get(
-                    m3u8_url,
-                    headers={
-                        "Referer": f"https://chaturbate.{tld}/{model}/",
-                        "Origin": f"https://chaturbate.{tld}",
-                    },
-                    timeout=10,
-                )
-                if r_pl.status_code == 200 and "#EXTM3U" in r_pl.text:
-                    base_host = "https://" + m3u8_url.split("/")[2]
-                    vid_paths = re.findall(r'(/v1/edge/streams/[^\s"\']+_video_[^\s"\']+)', r_pl.text)
-                    aud_paths = re.findall(r'URI="(/v1/edge/streams/[^\s"\']+_audio_[^\s"\']+)"', r_pl.text)
-                    if vid_paths:
-                        video_url = base_host + vid_paths[-1]
-                        audio_url = (base_host + aud_paths[0]) if aud_paths else None
-                        return {
-                            "ok": True,
-                            "room_status": "public",
-                            "video_url": video_url,
-                            "audio_url": audio_url,
-                            "tld": tld,
-                        }
-
-                # Fallback: request a fresh unconsumed m3u8_url for direct ffmpeg input
-                r_fresh = s.post(
-                    f"https://chaturbate.{tld}/get_edge_hls_url_ajax/",
-                    data={"room_slug": model},
-                    headers=headers,
-                    timeout=10,
-                )
-                if r_fresh.status_code == 200 and r_fresh.text.strip().startswith("{"):
-                    fresh_url = (r_fresh.json().get("url") or "").strip()
-                    if fresh_url:
-                        return {
-                            "ok": True,
-                            "room_status": "public",
-                            "video_url": fresh_url,
-                            "audio_url": None,
-                            "tld": tld,
-                        }
+                # Return the master m3u8 playlist URL directly!
+                # Do NOT dissect it into sub-rendition chunklists with ephemeral session tokens,
+                # as direct chunk requests cause 403 Forbidden on edge CDN.
+                return {
+                    "ok": True,
+                    "room_status": "public",
+                    "video_url": m3u8_url,
+                    "audio_url": None,
+                    "tld": tld,
+                }
             except Exception as e:
                 logger.debug(f"Chaturbate resolve attempt ({tld}/{imp}) error: {e}")
                 continue
+
+    # Fallback resolver: yt-dlp native extraction
+    try:
+        from yt_dlp import YoutubeDL
+        ydl = YoutubeDL({"quiet": True, "no_warnings": True})
+        info = ydl.extract_info(f"https://chaturbate.com/{model}/", download=False)
+        if info and info.get("is_live") and info.get("url"):
+            return {
+                "ok": True,
+                "room_status": "public",
+                "video_url": info["url"],
+                "audio_url": None,
+                "tld": "com",
+            }
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "offline" in err_msg:
+            return {"ok": False, "room_status": "offline"}
+        if "private" in err_msg:
+            return {"ok": False, "room_status": "private"}
+        if "away" in err_msg:
+            return {"ok": False, "room_status": "away"}
 
     return {"ok": False, "room_status": last_status}
 
@@ -577,7 +568,7 @@ class RecordingJob:
 
     def _poll_remote_stop(self):
         """Polls Cloudflare Worker signal to gracefully stop when user clicks Stop in Telegram."""
-        worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
+        worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
         targets = [self.identifier]
         if "_" in self.identifier:
             targets.append(self.identifier.split("_")[-1])
@@ -617,6 +608,71 @@ class RecordingJob:
                         self.process.kill()
                     except Exception:
                         pass
+
+    def _run_with_watchdog(self, cmd: list, log_path: Path, startup_timeout: int = 35) -> int:
+        """
+        Runs a recording subprocess with a startup watchdog.
+        If within startup_timeout seconds the process fails or produces 0 bytes while
+        logging fatal errors (403, 404, Error opening), it aborts early so subsequent
+        engines run immediately instead of hanging for hours in an infinite reconnect loop.
+        Once the output file receives data (> 50KB), it waits normally until completion or stop.
+        """
+        try:
+            mode = "a" if log_path.exists() else "w"
+            with open(log_path, mode, encoding="utf-8", errors="replace") as log_file:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+
+            started_writing = False
+            for sec in range(startup_timeout):
+                if self.stop_requested:
+                    self.stop()
+                    return self.process.wait()
+
+                ret = self.process.poll()
+                if ret is not None:
+                    return ret
+
+                if self.output_path.exists() and self.output_path.stat().st_size > 50 * 1024:
+                    started_writing = True
+                    break
+
+                if sec >= 8 and log_path.exists():
+                    try:
+                        tail = log_path.read_text(encoding="utf-8", errors="ignore")[-1500:].lower()
+                        if "403 forbidden" in tail or "server returned 403" in tail or "access denied" in tail:
+                            logger.warning(f"Watchdog detected fatal 403 Forbidden in log for {self.identifier}. Killing process early...")
+                            self.process.terminate()
+                            try:
+                                self.process.wait(timeout=5)
+                            except Exception:
+                                self.process.kill()
+                            return -1
+                    except Exception:
+                        pass
+
+                time.sleep(1)
+
+            if not started_writing:
+                ret = self.process.poll()
+                if ret is None and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
+                    logger.warning(f"Watchdog: no data written within {startup_timeout}s for {self.identifier}. Killing for fallback...")
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except Exception:
+                        self.process.kill()
+                    return -1
+
+            return self.process.wait()
+        except Exception as e:
+            self.error = str(e)
+            logger.error(f"Recording process execution error: {e}")
+            return -1
 
     def _run(self):
         logger.info(f"Starting recording for {self.identifier} on {self.platform} -> {self.output_path}")
@@ -665,53 +721,68 @@ class RecordingJob:
                     if cb_room_status == "offline":
                         break
 
-            if info.get("ok"):
-                tld = info.get("tld", "com")
-                ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
-                hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "info",
-                    "-user_agent", ua,
-                    "-headers", hdrs,
-                    "-reconnect", "1",
-                    "-reconnect_at_eof", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-fflags", "+nobuffer+discardcorrupt",
-                    "-i", info["video_url"],
-                ]
-                if info.get("audio_url"):
-                    cmd += [
+            cb_target_url = f"https://chaturbate.com/{self.identifier}/"
+
+            # Engine 1: yt-dlp native recording (safest against edge CDN 403 & session quirks)
+            logger.info(f"Starting Chaturbate recording via yt-dlp native for {self.identifier}...")
+            ytdlp_cmd = [
+                sys.executable,
+                "-m", "yt_dlp",
+                "--no-part",
+                "--no-warnings",
+                "--fixup", "never",
+                "--retries", "10",
+                "--fragment-retries", "10",
+                "--retry-sleep", "2",
+                "-o", str(self.output_path),
+                cb_target_url,
+            ]
+            self._run_with_watchdog(ytdlp_cmd, log_path, startup_timeout=35)
+
+            # Engine 2: ffmpeg with master m3u8 playlist if yt-dlp produced no file
+            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
+                info = resolve_chaturbate_stream(self.identifier)
+                if info.get("ok") and info.get("video_url"):
+                    logger.info(f"yt-dlp produced no file; trying ffmpeg with master m3u8 for {self.identifier}...")
+                    tld = info.get("tld", "com")
+                    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                    hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel", "info",
                         "-user_agent", ua,
                         "-headers", hdrs,
                         "-reconnect", "1",
+                        "-reconnect_at_eof", "1",
                         "-reconnect_streamed", "1",
-                        "-reconnect_delay_max", "5",
-                        "-i", info["audio_url"],
-                        "-map", "0:v:0",
-                        "-map", "1:a:0",
+                        "-reconnect_delay_max", "3",
+                        "-fflags", "+nobuffer+discardcorrupt",
+                        "-i", info["video_url"],
+                        "-c", "copy",
+                        "-bsf:a", "aac_adtstoasc",
+                        "-movflags", "+faststart",
+                        str(self.output_path),
                     ]
-                cmd += [
-                    "-c", "copy",
-                    "-bsf:a", "aac_adtstoasc",
-                    "-movflags", "+faststart",
-                    str(self.output_path),
-                ]
+                    self._run_with_watchdog(cmd, log_path, startup_timeout=35)
+
+            # Engine 3: streamlink direct fallback
+            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
                 try:
-                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
+                    logger.info(f"ffmpeg produced no file; trying streamlink fallback for {self.identifier}...")
+                    sl_record_cmd = [
+                        "streamlink",
+                        "--force",
+                        "--retry-streams", "5",
+                        "--retry-max", "5",
+                        cb_target_url,
+                        "best",
+                        "-o", str(self.output_path),
+                    ]
+                    self._run_with_watchdog(sl_record_cmd, log_path, startup_timeout=35)
                 except Exception as e:
-                    self.error = str(e)
-                    logger.error(f"Error recording {self.identifier} with ffmpeg: {e}")
+                    logger.warning(f"streamlink direct fallback error: {e}")
 
         elif self.platform == "tiktok":
             # TikTok Live via direct Webcast FLV continuous stream + ffmpeg
@@ -736,18 +807,7 @@ class RecordingJob:
                     "-movflags", "+faststart",
                     str(self.output_path),
                 ]
-                try:
-                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
-                except Exception as e:
-                    self.error = str(e)
-                    logger.error(f"Error recording TikTok {self.identifier} with ffmpeg: {e}")
+                self._run_with_watchdog(cmd, log_path, startup_timeout=35)
             else:
                 cb_room_status = "offline"
 
@@ -767,18 +827,7 @@ class RecordingJob:
                 "best",
                 "-o", str(self.output_path),
             ]
-            try:
-                with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                    self.process = subprocess.Popen(
-                        cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                    )
-                    self.process.wait()
-            except Exception as e:
-                self.error = str(e)
-                logger.error(f"Error recording Stripchat {self.identifier} with streamlink: {e}")
+            self._run_with_watchdog(cmd, log_path, startup_timeout=35)
 
             if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
                 info = resolve_stripchat_stream(self.stream_url)
@@ -884,18 +933,7 @@ class RecordingJob:
                     "-movflags", "+faststart",
                     str(self.output_path),
                 ]
-                try:
-                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
-                except Exception as e:
-                    self.error = str(e)
-                    logger.error(f"ffmpeg recording error for {self.identifier}: {e}")
+                self._run_with_watchdog(cmd, log_path, startup_timeout=35)
 
             # Step 3: If no valid file captured, record directly with yt-dlp
             if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
@@ -913,18 +951,7 @@ class RecordingJob:
                     str(self.output_path),
                     self.stream_url,
                 ]
-                try:
-                    with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
-                except Exception as e:
-                    self.error = str(e)
-                    logger.error(f"yt-dlp direct recording error for {self.identifier}: {e}")
+                self._run_with_watchdog(cmd, log_path, startup_timeout=35)
 
             # Step 4: If still no file and streamlink is available, fallback to direct streamlink
             if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
@@ -937,20 +964,13 @@ class RecordingJob:
                         self.stream_url,
                         "best",
                     ]
-                    with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            sl_record_cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
+                    self._run_with_watchdog(sl_record_cmd, log_path, startup_timeout=35)
                 except Exception as e:
                     logger.warning(f"streamlink direct recording error: {e}")
 
         # Clear stop signal in worker so future recordings are unaffected
         try:
-            worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
+            worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
             clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
             req = urllib.request.Request(clear_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -967,25 +987,26 @@ class RecordingJob:
         platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else ("Stripchat" if self.platform == "stripchat" else "Live"))
 
         if not file_exists:
-            if cb_room_status == "private":
-                err_reason = "في عرض خاص مستمر (Private Show / PVT) ولم يعد للبث العام خلال فترة الانتظار"
-            elif cb_room_status == "away":
-                err_reason = "متوقف مؤقتاً (Away)"
-            elif cb_room_status == "password protected":
-                err_reason = "محمي بكلمة مرور (Password Protected)"
-            else:
-                err_reason = "غير مباشر حالياً (Offline)"
+            log_tail = ""
+            if log_path.exists():
+                try:
+                    log_tail = log_path.read_text(encoding="utf-8", errors="ignore")[-2000:].lower()
+                    logger.info(f"Recorder log tail for {self.identifier}:\n{log_tail[-800:]}")
+                except Exception:
+                    pass
 
-            try:
-                if log_path.exists():
-                    log_text = log_path.read_text(encoding="utf-8", errors="ignore")
-                    logger.info(f"Recorder log tail for {self.identifier}:\n{log_text[-800:]}")
-                    if "private show" in log_text.lower() or "room is private" in log_text.lower():
-                        err_reason = "في عرض خاص مشفر (Private Show / PVT)"
-                    elif "offline" in log_text.lower():
-                        err_reason = "غير مباشر حالياً (Offline)"
-            except Exception:
-                pass
+            if "403 forbidden" in log_tail or "access denied" in log_tail:
+                err_reason = "تم حظر الاتصال بسيرفر البث (HTTP 403 CDN Block)"
+            elif cb_room_status == "private" or "private show" in log_tail or "room is private" in log_tail:
+                err_reason = "في عرض خاص مستمر (Private Show / PVT) ولم يعد للبث العام خلال فترة الانتظار"
+            elif cb_room_status == "away" or "away" in log_tail:
+                err_reason = "متوقف مؤقتاً (Away)"
+            elif cb_room_status == "password protected" or "password protected" in log_tail:
+                err_reason = "محمي بكلمة مرور (Password Protected)"
+            elif cb_room_status == "offline" or "offline" in log_tail or "usernotlive" in log_tail:
+                err_reason = "غير مباشر حالياً (Offline)"
+            else:
+                err_reason = "تعذر سحب البث أو انتهى سريعاً"
 
             logger.warning(f"Recording for {self.identifier} on {platform_name} ended without file: {err_reason}")
             notify_telegram(
