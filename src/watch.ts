@@ -275,6 +275,30 @@ async function dispatchRecorder(env: Env, t: WatchTarget): Promise<{ ok: boolean
   return { ok: res.status === 204 || res.ok, status: res.status, body: body.slice(0, 300) }
 }
 
+export async function triggerWatchTargetIfLive(
+  env: Env,
+  store: Store,
+  t: WatchTarget,
+): Promise<{ live: boolean; triggered: boolean; detail: string }> {
+  if (!env.GITHUB_TOKEN) return { live: false, triggered: false, detail: 'no_github_token' }
+  const check = await checkTargetLive(t)
+  if (check.state !== 'live') {
+    return { live: false, triggered: false, detail: check.detail }
+  }
+
+  const lockKey = `watch:lock:${t.platform}:${t.identifier}`
+  if (await store.get(lockKey)) {
+    return { live: true, triggered: false, detail: 'already_recording' }
+  }
+
+  const dispatch = await dispatchRecorder(env, t)
+  if (dispatch.ok) {
+    await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+    return { live: true, triggered: true, detail: check.detail }
+  }
+  return { live: true, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
+}
+
 export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: number; triggered: number; unknown: number }> {
   const started = Date.now()
 

@@ -62,6 +62,7 @@ import {
   addWatchTarget,
   removeWatchTarget,
   listUserWatchTargets,
+  triggerWatchTargetIfLive,
 } from '../watch'
 import {
   fetchYouTubeVideoDetails,
@@ -671,7 +672,7 @@ async function handleWatchCommand(
   message: TgMessage,
   rest: string,
   lang: Lang,
-  _env: Env,
+  env: Env,
   store: Store,
 ): Promise<void> {
   const chatId = message.chat.id
@@ -722,12 +723,55 @@ async function handleWatchCommand(
     return
   }
 
-  const plat = res.target!.platform === 'tiktok' ? 'TikTok Live' : 'Chaturbate'
+  const plat = res.target!.platform === 'tiktok' ? 'TikTok Live' : (res.target!.platform === 'stripchat' ? 'Stripchat' : 'Chaturbate')
+
+  // Immediate live check: if already live, dispatch recorder right now!
+  try {
+    const liveTrigger = await triggerWatchTargetIfLive(env, store, res.target!)
+    if (liveTrigger.triggered) {
+      const liveMsg = lang === 'ar'
+        ? `🟢 <b>الحساب مباشر (LIVE) الآن!</b>\n\n` +
+          `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+          `🎥 <b>تمت إضافته للمراقبة وبدأ التسجيل السحابي فوراً دون انتظار!</b>\n` +
+          `📦 سيتم إرسال الفيديو لك فور انتهاء البث.`
+        : `🟢 <b>Target is LIVE right now!</b>\n\n` +
+          `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+          `🎥 <b>Added to watch list & recording started immediately!</b>\n` +
+          `📦 Video will be sent when broadcast ends.`
+
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: liveMsg,
+        parse_mode: 'HTML',
+        reply_to_message_id: message.message_id,
+      })
+      return
+    }
+
+    if (liveTrigger.live && liveTrigger.detail === 'already_recording') {
+      const alreadyMsg = lang === 'ar'
+        ? `🟢 <b>الحساب مباشر (LIVE) الآن، والتسجيل السحابي يعمل له بالفعل!</b>\n\n` +
+          `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+          `📦 سيتم إرسال الفيديو فور اكتمال التسجيل.`
+        : `🟢 <b>Target is LIVE and already recording!</b>`
+
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: alreadyMsg,
+        parse_mode: 'HTML',
+        reply_to_message_id: message.message_id,
+      })
+      return
+    }
+  } catch (e) {
+    console.error('Immediate live check error:', e)
+  }
+
   const successMsg = lang === 'ar'
     ? `✅ <b>تمت الإضافة لقائمة المراقبة والتسجيل التلقائي!</b>\n\n` +
       `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
       `⏱️ <b>الفحص:</b> دوري كل 5 دقائق في السحابة\n` +
-      `🎥 <b>الإجراء:</b> أول ما يفتح لايف سيتم إشعارك وبدء التسجيل السحابي فوراً وجهازك مغلق.`
+      `🎥 <b>الإجراء:</b> الحساب غير مباشر حالياً، وأول ما يفتح لايف سيتم إشعارك وبدء التسجيل السحابي فوراً وجهازك مغلق.`
     : `✅ <b>Added to Auto-Record Watchlist!</b>\n\n` +
       `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
       `⏱️ <b>Interval:</b> Checked every 5 mins in cloud\n` +
