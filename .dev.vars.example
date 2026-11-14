@@ -1,0 +1,30 @@
+# Copy to .dev.vars for local dev, and use `wrangler secret put NAME` in production.
+
+# --- required ---
+BOT_TOKEN=123456789:AAExampleTokenFromBotFather
+WEBHOOK_SECRET=make-a-long-random-string-1
+SIGNING_SECRET=make-a-different-long-random-string-2
+PUBLIC_BASE_URL=http://localhost:8787
+
+# --- optional engines ---
+# Self-hosted yt-dlp sidecar (see sidecar/). Best quality + true MP3 for every platform.
+# YTDLP_ENDPOINT=https://your-sidecar.onrender.com
+# YTDLP_TOKEN=shared-secret-between-worker-and-sidecar
+
+# Self-hosted cobalt API (see https://github.com/imputnet/cobalt). Do NOT point this
+# at api.cobalt.tools: the maintainers ask you not to use their instance from apps.
+# COBALT_INSTANCES=https://cobalt.yourdomain.com
+# COBALT_API_KEY=
+
+# --- optional cookies (raise Instagram / Facebook / Pinterest success rate) ---
+# IG_COOKIE unlocks the HD Instagram avatar (profile_pic_url_hd) and private profiles.
+# IG_COOKIE=sessionid=xxxx; ds_user_id=xxxx; csrftoken=xxxx
+# FB_COOKIE=c_user=xxxx; xs=xxxx
+# PINTEREST_COOKIE=_auth=1; _pinterest_sess=xxxx
+
+# --- optional branding / limits ---
+# BOT_USERNAME=YourBot
+# BOT_LOCALE=auto
+# MAX_UPLOAD_MB=45
+# RATE_LIMIT_PER_MIN=12
+# PROFILE_MAX_ITEMS=30

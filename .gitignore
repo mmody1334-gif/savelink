@@ -1,0 +1,12 @@
+node_modules/
+.wrangler/
+dist/
+.dev.vars
+.dev.vars.bak
+*.log
+scratch/
+recordings_data/
+__pycache__/
+*.pyc
+sidecar/__pycache__/
+sidecar/.venv/

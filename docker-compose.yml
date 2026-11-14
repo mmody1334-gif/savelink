@@ -1,0 +1,27 @@
+services:
+  sidecar:
+    build:
+      context: ./sidecar
+    ports:
+      - "8000:8000"
+    environment:
+      # Shared secret with the Worker (wrangler secret YTDLP_TOKEN).
+      YTDLP_TOKEN: ${YTDLP_TOKEN:-}
+      # Public URL of this service, so the Worker can fetch finished files.
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
+      MEDIA_DIR: /data
+      MEDIA_TTL_SECONDS: "3600"
+      MAX_FILESIZE_MB: "400"
+      # Instagram stories/highlights (/ig/*): a logged-in cookie + optional proxy.
+      IG_COOKIE: ${IG_COOKIE:-}
+      IG_PROXY: ${IG_PROXY:-}
+      # Optional: path to a Netscape cookie file for private posts.
+      # COOKIES_FILE: /data/cookies.txt
+      # Optional: outbound proxy.
+      # PROXY: http://user:pass@host:port
+    volumes:
+      - savelink-media:/data
+    restart: unless-stopped
+
+volumes:
+  savelink-media:

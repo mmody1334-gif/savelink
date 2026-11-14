@@ -1,0 +1,36 @@
+name = "savelink"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[vars]
+# Order of engines. Unconfigured engines are skipped automatically.
+# ytdlp  -> needs YTDLP_ENDPOINT (self-hosted, best quality, real MP3)
+# native -> no setup, direct platform extractors (works out of the box)
+# cobalt -> needs COBALT_INSTANCES (self-hosted cobalt API)
+ENGINE_ORDER = "ytdlp,native,cobalt"
+MAX_UPLOAD_MB = "45"
+MAX_PROXY_MB = "2048"
+PROFILE_MAX_ITEMS = "100"
+RATE_LIMIT_PER_MIN = "12"
+BOT_LOCALE = "auto"
+BOT_USERNAME = "t0kt0kdownloader2bot"
+# Stories/highlights come from a hosted Instagram API (free Apify credit).
+# The key itself is a secret: `wrangler secret put IG_API_KEY`.
+IG_PROVIDER = "apify"
+# "embed" = free, but Instagram only embeds a handful of posts.
+# "api"   = pull the feed from the hosted API up to PROFILE_MAX_ITEMS (billed per post).
+PROFILE_SOURCE = "embed"
+GITHUB_RECORDER_REPO = "mmody1334-gif/savelink"
+
+[observability]
+enabled = true
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Persistent state: button payloads, result cache and rate limits survive
+# isolate restarts. Free plan includes 100k reads + 1k writes per day.
+[[kv_namespaces]]
+binding = "CACHE"
+id = "d0ebfc6ba7044f65aec1f03aa5fcea09"
