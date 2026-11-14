@@ -1,4 +1,5 @@
 name = "savelink"
+account_id = "0000e4925fd52a263ae76a9053eade14"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
 workers_dev = true
@@ -21,7 +22,7 @@ IG_PROVIDER = "apify"
 # "embed" = free, but Instagram only embeds a handful of posts.
 # "api"   = pull the feed from the hosted API up to PROFILE_MAX_ITEMS (billed per post).
 PROFILE_SOURCE = "embed"
-GITHUB_RECORDER_REPO = "mmody1334-gif/savelink"
+GITHUB_RECORDER_REPO = "mmody1334-gif/cb-recorder"
 
 [observability]
 enabled = true
@@ -33,4 +34,4 @@ crons = ["*/5 * * * *"]
 # isolate restarts. Free plan includes 100k reads + 1k writes per day.
 [[kv_namespaces]]
 binding = "CACHE"
-id = "d0ebfc6ba7044f65aec1f03aa5fcea09"
+id = "4b2d29529aee424e8dbc4ce0e6e53a52"

@@ -12,6 +12,30 @@ export interface WatchTarget {
 
 const WATCH_INDEX_KEY = 'watch:index:all'
 
+/**
+ * Watch entries must outlive the default store TTL (1h). Without this the whole
+ * watchlist silently expires an hour after /watch and the cron stops seeing it.
+ */
+const WATCH_TTL_SECONDS = 60 * 60 * 24 * 365
+
+/** Cron invocation budget. Workers cut waitUntil off ~30s after the response. */
+const CYCLE_BUDGET_MS = 20_000
+const CHECK_TIMEOUT_MS = 8_000
+const MAX_PARALLEL = 6
+const SESSION_LOCK_SECONDS = 7200
+
+export type LiveState = 'live' | 'offline' | 'unknown'
+
+export interface LiveCheck {
+  state: LiveState
+  /** machine-readable reason, e.g. 'public', 'private', 'http_404', 'not_json' */
+  detail: string
+  hls?: string
+  viewers?: number
+  /** true only when a public stream URL exists, i.e. the recorder can pull it */
+  recordable?: boolean
+}
+
 export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturbate' | 'stripchat'; identifier: string; clean: string } | null {
   const clean = input.trim()
   if (!clean) return null
@@ -68,13 +92,15 @@ export async function addWatchTarget(
   }
 
   userList.push(target)
-  await store.put(userKey, JSON.stringify(userList))
+  await store.put(userKey, JSON.stringify(userList), WATCH_TTL_SECONDS)
 
   // 2. Global index
   const indexRaw = await store.get(WATCH_INDEX_KEY)
-  const globalList: WatchTarget[] = indexRaw ? JSON.parse(indexRaw) : []
+  const globalList: WatchTarget[] = (indexRaw ? JSON.parse(indexRaw) : []).filter(
+    (t: WatchTarget) => !(String(t.chatId) === String(chatId) && t.identifier === target.identifier && t.platform === target.platform),
+  )
   globalList.push(target)
-  await store.put(WATCH_INDEX_KEY, JSON.stringify(globalList))
+  await store.put(WATCH_INDEX_KEY, JSON.stringify(globalList), WATCH_TTL_SECONDS)
 
   return { ok: true, target }
 }
@@ -96,7 +122,7 @@ export async function removeWatchTarget(
     (t) => t.identifier.toLowerCase() !== targetStr && t.target.toLowerCase() !== targetStr,
   )
   const removed = beforeLen - filtered.length
-  await store.put(userKey, JSON.stringify(filtered))
+  await store.put(userKey, JSON.stringify(filtered), WATCH_TTL_SECONDS)
 
   // Update global index
   const indexRaw = await store.get(WATCH_INDEX_KEY)
@@ -105,7 +131,7 @@ export async function removeWatchTarget(
     const newGlobal = globalList.filter(
       (t) => !(String(t.chatId) === String(chatId) && (t.identifier.toLowerCase() === targetStr || t.target.toLowerCase() === targetStr)),
     )
-    await store.put(WATCH_INDEX_KEY, JSON.stringify(newGlobal))
+    await store.put(WATCH_INDEX_KEY, JSON.stringify(newGlobal), WATCH_TTL_SECONDS)
   }
 
   return { ok: true, count: removed }
@@ -117,129 +143,227 @@ export async function listUserWatchTargets(chatId: number | string, store: Store
   return userListRaw ? JSON.parse(userListRaw) : []
 }
 
-export async function checkTargetIsLive(target: WatchTarget): Promise<boolean> {
-  if (target.platform === 'tiktok') {
+/** Chaturbate statuses where the room is on air (public is the only recordable one). */
+const CB_ON_AIR = new Set(['public', 'private', 'group', 'hidden', 'away', 'password protected'])
+
+/**
+ * Tri-state live check. 'unknown' means the platform could not be read
+ * (404, non-JSON, blocked, timeout) and must never be treated as offline.
+ */
+export async function checkTargetLive(target: WatchTarget): Promise<LiveCheck> {
+  const id = target.identifier.replace(/^@/, '').toLowerCase()
+
+  if (target.platform === 'chaturbate') {
     try {
-      const cleanUser = target.identifier.replace(/^@/, '')
-      const res = await fetch(`https://www.tiktok.com/@${cleanUser}/live`, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        signal: AbortSignal.timeout(8000),
+      const res = await fetch(`https://chaturbate.com/api/chatvideocontext/${encodeURIComponent(id)}/`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+        signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       })
-      const html = await res.text()
-      return html.includes('"status":2') || (html.includes('"liveRoom":') && !html.includes('"status":4'))
-    } catch {
-      return false
+      if (res.status === 404) return { state: 'unknown', detail: 'no_such_room' }
+      if (!res.ok) return { state: 'unknown', detail: `http_${res.status}` }
+
+      const ct = res.headers.get('content-type') || ''
+      if (!ct.includes('json')) return { state: 'unknown', detail: 'not_json' }
+
+      const data: any = await res.json()
+      const status = String(data?.room_status ?? '').toLowerCase()
+      const hls = typeof data?.hls_source === 'string' ? data.hls_source : ''
+      const viewers = typeof data?.num_viewers === 'number' ? data.num_viewers : undefined
+
+      if (!status) return { state: 'unknown', detail: 'no_room_status' }
+      const onAir = CB_ON_AIR.has(status) || Boolean(hls)
+      return {
+        state: onAir ? 'live' : 'offline',
+        detail: status || 'unknown',
+        hls: hls || undefined,
+        viewers,
+        recordable: Boolean(hls),
+      }
+    } catch (e) {
+      return { state: 'unknown', detail: `error:${(e as Error).name}` }
     }
   }
 
   if (target.platform === 'stripchat') {
     try {
-      const res = await fetch(`https://stripchat.com/api/front/v2/users/username/${target.identifier}`, {
+      const res = await fetch(`https://stripchat.com/api/front/v2/users/username/${encodeURIComponent(id)}`, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
+          Accept: 'application/json',
         },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       })
-      if (!res.ok) return false
+      if (res.status === 404) return { state: 'unknown', detail: 'no_such_room' }
+      if (!res.ok) return { state: 'unknown', detail: `http_${res.status}` }
       const data: any = await res.json()
-      const u = data.user
-      return !!(u && u.isLive && u.status === 'public')
-    } catch {
-      return false
+      const u = data?.user
+      if (!u) return { state: 'unknown', detail: 'no_user' }
+      const status = String(u.status ?? '').toLowerCase()
+      const onAir = Boolean(u.isLive) && ['public', 'private', 'group', 'p2p'].includes(status)
+      return {
+        state: onAir ? 'live' : 'offline',
+        detail: status || (u.isLive ? 'live' : 'offline'),
+        recordable: Boolean(u.isLive) && status === 'public',
+      }
+    } catch (e) {
+      return { state: 'unknown', detail: `error:${(e as Error).name}` }
     }
   }
 
-  if (target.platform === 'chaturbate') {
+  if (target.platform === 'tiktok') {
     try {
-      const res = await fetch(`https://chaturbate.com/api/chatvideocontext/${target.identifier}/`, {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(8000),
+      const res = await fetch(`https://www.tiktok.com/@${encodeURIComponent(id)}/live`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       })
-      if (!res.ok) return false
-      const data: any = await res.json()
-      return data.room_status === 'public'
-    } catch {
-      return false
+      if (!res.ok) return { state: 'unknown', detail: `http_${res.status}` }
+      const html = await res.text()
+      if (!html.includes('__UNIVERSAL_DATA_FOR_REHYDRATION__') && !html.includes('roomId')) {
+        return { state: 'unknown', detail: 'no_page_data' }
+      }
+      const live = html.includes('"status":2') || (html.includes('"liveRoom"') && !html.includes('"status":4'))
+      return { state: live ? 'live' : 'offline', detail: live ? 'live' : 'offline', recordable: live }
+    } catch (e) {
+      return { state: 'unknown', detail: `error:${(e as Error).name}` }
     }
   }
 
-  return false
+  return { state: 'unknown', detail: 'unsupported_platform' }
 }
 
-export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: number; triggered: number }> {
-  const token = env.GITHUB_TOKEN
+/** Boolean wrapper kept for backward compatibility. */
+export async function checkTargetIsLive(target: WatchTarget): Promise<boolean> {
+  return (await checkTargetLive(target)).state === 'live'
+}
+
+function platformLabel(platform: WatchTarget['platform']): string {
+  if (platform === 'tiktok') return 'TikTok Live'
+  if (platform === 'stripchat') return 'Stripchat'
+  return 'Chaturbate'
+}
+
+function recorderTargetParam(t: WatchTarget): string {
+  if (t.platform === 'tiktok') return `@${t.identifier}`
+  if (t.platform === 'stripchat') return `https://stripchat.com/${t.identifier}`
+  return t.identifier
+}
+
+async function dispatchRecorder(env: Env, t: WatchTarget): Promise<{ ok: boolean; status: number; body: string }> {
   const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
-  if (!token) return { checked: 0, triggered: 0 }
+  const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'SaveLink-Telegram-Bot',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      ref: 'main',
+      inputs: {
+        model: recorderTargetParam(t),
+        chat_id: String(t.chatId),
+        bot_token: env.BOT_TOKEN || '',
+      },
+    }),
+  })
+  const body = res.status === 204 ? '' : await res.text().catch(() => '')
+  return { ok: res.status === 204 || res.ok, status: res.status, body: body.slice(0, 300) }
+}
+
+export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: number; triggered: number; unknown: number }> {
+  const started = Date.now()
+
+  if (!env.GITHUB_TOKEN) {
+    console.error('[watch] GITHUB_TOKEN is not set — auto-record cannot dispatch. Add it with: wrangler secret put GITHUB_TOKEN')
+    return { checked: 0, triggered: 0, unknown: 0 }
+  }
 
   const indexRaw = await store.get(WATCH_INDEX_KEY)
-  if (!indexRaw) return { checked: 0, triggered: 0 }
+  if (!indexRaw) {
+    console.log('[watch] watchlist key missing/expired — nothing to check')
+    return { checked: 0, triggered: 0, unknown: 0 }
+  }
 
-  const targets: WatchTarget[] = JSON.parse(indexRaw)
-  if (!targets.length) return { checked: 0, triggered: 0 }
+  let targets: WatchTarget[] = []
+  try {
+    targets = JSON.parse(indexRaw)
+  } catch {
+    console.error('[watch] watchlist is corrupt JSON, resetting')
+    await store.delete(WATCH_INDEX_KEY)
+    return { checked: 0, triggered: 0, unknown: 0 }
+  }
+  if (!targets.length) return { checked: 0, triggered: 0, unknown: 0 }
+
+  console.log(`[watch] cycle start: ${targets.length} target(s)`)
 
   let triggered = 0
-  const now = Date.now()
+  let unknown = 0
+  let checked = 0
 
-  for (const t of targets) {
-    // Prevent re-triggering for the same live session within 2 hours
-    const activeLockKey = `watch:lock:${t.platform}:${t.identifier}`
-    const isLocked = await store.get(activeLockKey)
-    if (isLocked) continue
+  for (let i = 0; i < targets.length; i += MAX_PARALLEL) {
+    if (Date.now() - started > CYCLE_BUDGET_MS) {
+      console.warn(`[watch] budget exhausted after ${checked}/${targets.length} targets — remaining run next cycle`)
+      break
+    }
 
-    const isLive = await checkTargetIsLive(t)
-    if (isLive) {
-      // Set lock for 2 hours (7200 seconds)
-      await store.put(activeLockKey, String(now), 7200)
+    const batch = targets.slice(i, i + MAX_PARALLEL)
+    const results = await Promise.all(
+      batch.map(async (t) => ({ t, check: await checkTargetLive(t) })),
+    )
 
-      // Trigger cloud recorder
-      const targetParam = t.platform === 'tiktok' ? `@${t.identifier}` : (t.platform === 'stripchat' ? `https://stripchat.com/${t.identifier}` : t.identifier)
+    for (const { t, check } of results) {
+      checked++
+      console.log(
+        `[watch] ${t.platform}/${t.identifier} -> ${check.state} (${check.detail})` +
+          (check.viewers !== undefined ? ` viewers=${check.viewers}` : '') +
+          (check.recordable ? ' recordable=yes' : ''),
+      )
+
+      if (check.state === 'unknown') {
+        unknown++
+        continue
+      }
+      if (check.state === 'offline') continue
+
+      const lockKey = `watch:lock:${t.platform}:${t.identifier}`
+      if (await store.get(lockKey)) continue
+
       try {
-        const url = `https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            Authorization: `token ${token}`,
-            Accept: 'application/vnd.github.v3+json',
-            'User-Agent': 'SaveLink-Telegram-Bot',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            ref: 'main',
-            inputs: {
-              model: targetParam,
-              chat_id: String(t.chatId),
-              bot_token: env.BOT_TOKEN || '',
-            },
-          }),
-        })
+        const dispatch = await dispatchRecorder(env, t)
+        if (!dispatch.ok) {
+          console.error(`[watch] dispatch failed for ${t.identifier}: HTTP ${dispatch.status} ${dispatch.body}`)
+          continue
+        }
 
-        if (res.status === 204 || res.ok) {
-          triggered++
-          // Notify user
-          if (env.BOT_TOKEN) {
-            const tg = new TelegramApi(env.BOT_TOKEN)
-            const plat = t.platform === 'tiktok' ? 'TikTok Live' : 'Chaturbate'
-            const alertMsg =
-              `🔔 <b>بدأ البث المباشر الآن!</b>\n\n` +
-              `👤 <b>الحساب:</b> <code>${t.target}</code> (${plat})\n` +
-              `🎥 تم تشغيل المسجل السحابي آلياً في الخلفية (Auto-Record).\n` +
-              `📦 سيتم رفع الفيديو فوراً وإرساله لك عند انتهاء البث.`
-            await tg.call('sendMessage', {
-              chat_id: t.chatId,
-              text: alertMsg,
-              parse_mode: 'HTML',
-            })
-          }
+        // Lock only after a confirmed dispatch, so a failure is retried next cycle.
+        await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+        triggered++
+
+        if (env.BOT_TOKEN) {
+          const tg = new TelegramApi(env.BOT_TOKEN)
+          const alertMsg =
+            `🔔 <b>بدأ البث المباشر الآن!</b>\n\n` +
+            `👤 <b>الحساب:</b> <code>${t.target}</code> (${platformLabel(t.platform)})\n` +
+            `🎥 تم تشغيل المسجل السحابي آلياً في الخلفية (Auto-Record).\n` +
+            (check.recordable === false
+              ? `⚠️ الحالة الآن: <b>${check.detail}</b> — ليس بثاً عاماً، التسجيل سيبدأ تلقائياً عند العودة للبث العام.\n`
+              : '') +
+            `📦 سيتم رفع الفيديو فوراً وإرساله لك عند انتهاء البث.`
+          await tg.call('sendMessage', { chat_id: t.chatId, text: alertMsg, parse_mode: 'HTML' }).catch((e: unknown) => {
+            console.error('[watch] telegram alert failed', e)
+          })
         }
       } catch (e) {
-        console.error('Failed to trigger watch recorder for', t.target, e)
+        console.error('[watch] dispatch error for', t.target, e)
       }
     }
   }
 
-  return { checked: targets.length, triggered }
+  console.log(`[watch] cycle done: checked=${checked} triggered=${triggered} unknown=${unknown} in ${Date.now() - started}ms`)
+  return { checked, triggered, unknown }
 }
