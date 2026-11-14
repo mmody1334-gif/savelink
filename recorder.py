@@ -570,13 +570,19 @@ class RecordingJob:
         """Polls Cloudflare Worker signal to gracefully stop when user clicks Stop in Telegram."""
         worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
         targets = [self.identifier]
+        clean_id = self.identifier.strip("_")
+        if clean_id and clean_id not in targets:
+            targets.append(clean_id)
         if "_" in self.identifier:
-            targets.append(self.identifier.split("_")[-1])
+            for part in self.identifier.split("_"):
+                if part and part not in targets:
+                    targets.append(part)
+
         while not self.stop_requested and (self.process is None or self.process.poll() is None):
             for tgt in targets:
                 try:
                     poll_url = f"{worker_base}/api/record/signal?target={urllib.parse.quote(tgt)}"
-                    req = urllib.request.Request(poll_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+                    req = urllib.request.Request(poll_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         data = json.loads(resp.read().decode())
                         if data.get("stop"):
@@ -585,7 +591,7 @@ class RecordingJob:
                             return
                 except Exception:
                     pass
-            time.sleep(3)
+            time.sleep(2)
 
     def stop(self):
         self.stop_requested = True
@@ -723,54 +729,53 @@ class RecordingJob:
 
             cb_target_url = f"https://chaturbate.com/{self.identifier}/"
 
-            # Engine 1: yt-dlp native recording (safest against edge CDN 403 & session quirks)
-            logger.info(f"Starting Chaturbate recording via yt-dlp native for {self.identifier}...")
-            ytdlp_cmd = [
-                sys.executable,
-                "-m", "yt_dlp",
-                "--no-part",
-                "--no-warnings",
-                "--fixup", "never",
-                "--retries", "10",
-                "--fragment-retries", "10",
-                "--retry-sleep", "2",
-                "-o", str(self.output_path),
-                cb_target_url,
-            ]
-            self._run_with_watchdog(ytdlp_cmd, log_path, startup_timeout=35)
+            # Engine 1: ffmpeg direct master HLS recording (supports instant graceful stop via 'q' & flushes every frame)
+            if info.get("ok") and info.get("video_url") and not self.stop_requested:
+                logger.info(f"Starting Chaturbate recording via ffmpeg for {self.identifier}...")
+                tld = info.get("tld", "com")
+                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-user_agent", ua,
+                    "-headers", hdrs,
+                    "-reconnect", "1",
+                    "-reconnect_at_eof", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "3",
+                    "-fflags", "+nobuffer+discardcorrupt",
+                    "-i", info["video_url"],
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    "-movflags", "+faststart",
+                    str(self.output_path),
+                ]
+                self._run_with_watchdog(cmd, log_path, startup_timeout=35)
 
-            # Engine 2: ffmpeg with master m3u8 playlist if yt-dlp produced no file
-            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
-                info = resolve_chaturbate_stream(self.identifier)
-                if info.get("ok") and info.get("video_url"):
-                    logger.info(f"yt-dlp produced no file; trying ffmpeg with master m3u8 for {self.identifier}...")
-                    tld = info.get("tld", "com")
-                    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-                    hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
-                    cmd = [
-                        "ffmpeg",
-                        "-y",
-                        "-hide_banner",
-                        "-loglevel", "info",
-                        "-user_agent", ua,
-                        "-headers", hdrs,
-                        "-reconnect", "1",
-                        "-reconnect_at_eof", "1",
-                        "-reconnect_streamed", "1",
-                        "-reconnect_delay_max", "3",
-                        "-fflags", "+nobuffer+discardcorrupt",
-                        "-i", info["video_url"],
-                        "-c", "copy",
-                        "-bsf:a", "aac_adtstoasc",
-                        "-movflags", "+faststart",
-                        str(self.output_path),
-                    ]
-                    self._run_with_watchdog(cmd, log_path, startup_timeout=35)
+            # Engine 2: yt-dlp native fallback if ffmpeg failed or produced no file (only if stop was not requested)
+            if not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
+                logger.info(f"ffmpeg produced no file; falling back to yt-dlp native for {self.identifier}...")
+                ytdlp_cmd = [
+                    sys.executable,
+                    "-m", "yt_dlp",
+                    "--no-part",
+                    "--no-warnings",
+                    "--fixup", "never",
+                    "--retries", "10",
+                    "--fragment-retries", "10",
+                    "--retry-sleep", "2",
+                    "-o", str(self.output_path),
+                    cb_target_url,
+                ]
+                self._run_with_watchdog(ytdlp_cmd, log_path, startup_timeout=35)
 
-            # Engine 3: streamlink direct fallback
-            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
+            # Engine 3: streamlink direct fallback (only if stop was not requested)
+            if not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
                 try:
-                    logger.info(f"ffmpeg produced no file; trying streamlink fallback for {self.identifier}...")
+                    logger.info(f"yt-dlp produced no file; trying streamlink fallback for {self.identifier}...")
                     sl_record_cmd = [
                         "streamlink",
                         "--force",
@@ -972,7 +977,7 @@ class RecordingJob:
         try:
             worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
             clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
-            req = urllib.request.Request(clear_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+            req = urllib.request.Request(clear_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 resp.read()
         except Exception:
@@ -983,7 +988,7 @@ class RecordingJob:
             if self.identifier in active_jobs:
                 del active_jobs[self.identifier]
 
-        file_exists = self.output_path.exists() and self.output_path.stat().st_size > 50 * 1024
+        file_exists = self.output_path.exists() and self.output_path.stat().st_size > 10 * 1024
         platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else ("Stripchat" if self.platform == "stripchat" else "Live"))
 
         if not file_exists:

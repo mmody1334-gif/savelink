@@ -2737,6 +2737,10 @@ async function handleStopCommand(
   try {
     const cleanModel = model.replace(/^@/, '').toLowerCase()
     await store.put(`stop:${cleanModel}`, '1', 3600)
+    const trimmed = cleanModel.replace(/^_+|_+$/g, '')
+    if (trimmed && trimmed !== cleanModel) {
+      await store.put(`stop:${trimmed}`, '1', 3600)
+    }
 
     if (endpoint) {
       const base = endpoint.replace(/\/+$/, '')
@@ -2796,6 +2800,10 @@ async function handleRecordCallback(
     try {
       const cleanModel = model.replace(/^@/, '').toLowerCase()
       await _store.put(`stop:${cleanModel}`, '1', 3600)
+      const trimmed = cleanModel.replace(/^_+|_+$/g, '')
+      if (trimmed && trimmed !== cleanModel) {
+        await _store.put(`stop:${trimmed}`, '1', 3600)
+      }
 
       if (endpoint) {
         const base = endpoint.replace(/\/+$/, '')
