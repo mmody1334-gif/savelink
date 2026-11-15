@@ -1122,11 +1122,11 @@ class RecordingJob:
         # Optimize container for instant in-browser streaming (FastStart)
         self.output_path = ensure_faststart_streaming(self.output_path)
 
-        # 1. Try Gofile (fast, reliable, no size limit)
-        download_url = upload_to_gofile(self.output_path)
-        # 2. Try Pixeldrain as fallback
+        # 1. Try Pixeldrain (supports direct in-browser streaming, fast, up to 10GB)
+        download_url = upload_to_pixeldrain(self.output_path)
+        # 2. Try Gofile as fallback
         if not download_url:
-            download_url = upload_to_pixeldrain(self.output_path)
+            download_url = upload_to_gofile(self.output_path)
 
         self.final_url = download_url
         logger.info(f"Uploaded URL for {self.identifier}: {download_url}")

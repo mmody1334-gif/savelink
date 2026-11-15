@@ -201,9 +201,11 @@ def main():
 
         logger.info(f"Uploading remaining file: {mp4.name} ({size_str})...")
         mp4 = ensure_faststart_streaming(mp4)
-        download_url = upload_to_gofile(mp4)
+        # 1. Try Pixeldrain (supports direct in-browser streaming, fast, up to 10GB)
+        download_url = upload_to_pixeldrain(mp4)
+        # 2. Try Gofile as fallback
         if not download_url:
-            download_url = upload_to_pixeldrain(mp4)
+            download_url = upload_to_gofile(mp4)
 
         if download_url:
             msg = (
