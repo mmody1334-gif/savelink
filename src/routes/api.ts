@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { ENGINES } from '../engines'
 import { getStore } from '../store'
 import type { Env } from '../types'
+import { isPaused } from '../pause'
 import {
   parseWatchTarget,
   checkTargetLive,
@@ -13,6 +14,16 @@ import {
 } from '../watch'
 
 export const apiRoute = new Hono<{ Bindings: Env }>()
+
+// Global kill switch: while paused, every API route is refused except health,
+// and recorders polling /record/signal are told to stop.
+apiRoute.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname
+  if (path.endsWith('/health')) return next()
+  if (!(await isPaused(c.env))) return next()
+  if (path.endsWith('/record/signal')) return c.json({ stop: true, paused: true })
+  return c.json({ ok: false, error: 'paused' }, 503)
+})
 
 apiRoute.get('/health', (c) => {
   const engines = Object.values(ENGINES)

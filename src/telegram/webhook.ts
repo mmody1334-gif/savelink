@@ -20,6 +20,7 @@ import {
 } from '../facebook-stories'
 import { handleMovieCallback, handleMovieCommand } from './movie-handlers'
 import { handleBypassCommand } from './bypass-handlers'
+import { isPaused, setPaused, canControlPause, cancelAllGitHubRuns } from '../pause'
 import {
   handleAiCommand,
   handleAudioMessage,
@@ -231,6 +232,16 @@ export async function telegramWebhook(c: Context<{ Bindings: Env }>): Promise<Re
   const tg = new TelegramApi(env.BOT_TOKEN)
   const origin = new URL(c.req.url).origin
 
+  // Global kill switch: while paused, only /resumeall (and /stopall) get through.
+  if (await isPaused(env)) {
+    try {
+      await handlePausedUpdate(tg, update, env)
+    } catch (error) {
+      console.error('paused update error', errorMessage(error))
+    }
+    return c.text('ok')
+  }
+
   try {
     if (update?.update_id) {
       const dedupeKey = `u:${update.update_id}`
@@ -366,6 +377,16 @@ async function handleCommand(
   const rest = (match?.[2] ?? '').trim()
 
   switch (command) {
+    case 'stopall':
+    case 'pauseall': {
+      await handleStopAll(tg, message, env)
+      return
+    }
+    case 'resumeall':
+    case 'startall': {
+      await handleResumeAll(tg, message, env)
+      return
+    }
     case 'start':
     case 'help':
     case 'menu': {
@@ -5390,5 +5411,79 @@ async function handleMenuCallback(
     text,
     parse_mode: 'HTML',
     reply_markup: backKb,
+  })
+}
+
+// ==========================================
+// GLOBAL KILL SWITCH (/stopall, /resumeall)
+// ==========================================
+
+function pauseCommandOf(text: string): string {
+  const m = text.trim().match(/^\/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?/)
+  return (m?.[1] ?? '').toLowerCase()
+}
+
+async function handlePausedUpdate(tg: TelegramApi, update: any, env: Env): Promise<void> {
+  if (update?.callback_query) {
+    await tg
+      .call('answerCallbackQuery', {
+        callback_query_id: update.callback_query.id,
+        text: '⏸ البوت متوقف مؤقتًا',
+        show_alert: false,
+      })
+      .catch(() => {})
+    return
+  }
+  const message = (update?.message ?? update?.channel_post) as TgMessage | undefined
+  if (!message?.chat || message.from?.is_bot) return
+  const command = pauseCommandOf(String(message.text ?? ''))
+  if (command === 'resumeall' || command === 'startall') {
+    await handleResumeAll(tg, message, env)
+    return
+  }
+  if (command === 'stopall' || command === 'pauseall') {
+    await handleStopAll(tg, message, env)
+    return
+  }
+  if (!canControlPause(env, message.from?.id)) return
+  await tg.call('sendMessage', {
+    chat_id: message.chat.id,
+    text: '⏸ البوت متوقف بالكامل حاليًا.\nلتشغيله مرة أخرى أرسل /resumeall',
+    reply_to_message_id: message.message_id,
+  })
+}
+
+async function handleStopAll(tg: TelegramApi, message: TgMessage, env: Env): Promise<void> {
+  const chatId = message.chat.id
+  if (!canControlPause(env, message.from?.id)) return
+  await setPaused(env, true, message.from?.id)
+  let cancelled = 0
+  try {
+    cancelled = await cancelAllGitHubRuns(env)
+  } catch (error) {
+    console.error('stopall cancel error', errorMessage(error))
+  }
+  await tg.call('sendMessage', {
+    chat_id: chatId,
+    text:
+      '⛔ <b>تم إيقاف كل شيء</b>\n\n' +
+      '• البوت لن يرد على أي أمر أو رابط\n' +
+      '• المراقبة التلقائية متوقفة\n' +
+      '• التسجيلات الشغالة تلقت أمر الإيقاف\n' +
+      `• تم إلغاء ${cancelled} عملية على GitHub Actions\n\n` +
+      'لتشغيله مرة أخرى أرسل /resumeall',
+    parse_mode: 'HTML',
+    reply_to_message_id: message.message_id,
+  })
+}
+
+async function handleResumeAll(tg: TelegramApi, message: TgMessage, env: Env): Promise<void> {
+  if (!canControlPause(env, message.from?.id)) return
+  await setPaused(env, false)
+  await tg.call('sendMessage', {
+    chat_id: message.chat.id,
+    text: '▶️ <b>البوت رجع يشتغل</b>\nكل الأوامر والمراقبة التلقائية شغالة تاني.',
+    parse_mode: 'HTML',
+    reply_to_message_id: message.message_id,
   })
 }

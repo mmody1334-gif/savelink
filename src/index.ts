@@ -4,6 +4,7 @@ import { fileRoute } from './routes/file'
 import { telegramWebhook } from './telegram/webhook'
 import { getStore } from './store'
 import { runWatchCycle } from './watch'
+import { isPaused } from './pause'
 import type { Env } from './types'
 
 const app = new Hono<{ Bindings: Env }>()
@@ -32,6 +33,7 @@ app.onError((error, c) => {
 export default {
   fetch: app.fetch,
   async scheduled(_event: any, env: Env, ctx: any) {
+    if (await isPaused(env)) return
     const store = getStore(env)
     ctx.waitUntil(runWatchCycle(env, store))
   },

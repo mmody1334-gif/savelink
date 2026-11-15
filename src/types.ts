@@ -58,6 +58,8 @@ export interface Engine {
 export interface Env {
   BOT_TOKEN?: string
   WEBHOOK_SECRET?: string
+  /** Comma-separated Telegram user ids allowed to use /stopall and /resumeall. */
+  OWNER_ID?: string
   SIGNING_SECRET?: string
   PUBLIC_BASE_URL?: string
   BOT_USERNAME?: string
