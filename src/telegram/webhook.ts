@@ -892,12 +892,64 @@ async function handleTrimCommand(
   } else if (parts.length === 2) {
     start = parts[0]
     end = parts[1]
-    const reply = message.reply_to_message
-    if (reply) {
-      const text = reply.text || reply.caption || ''
-      const urlMatch = text.match(/https?:\/\/[^\s]+/)
-      if (urlMatch) url = urlMatch[0]
+  }
+
+  // If URL not in arguments, try current message or reply
+  if (!url) {
+    const curFileId = message.video?.file_id || 
+      (message.document?.mime_type?.startsWith('video/') ? message.document.file_id : undefined) ||
+      message.animation?.file_id
+
+    if (curFileId && env.BOT_TOKEN) {
+      try {
+        const fileInfo = await tg.call<{ file_id: string; file_path?: string }>('getFile', { file_id: curFileId })
+        if (fileInfo?.file_path) {
+          url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.file_path}`
+        }
+      } catch (err) {
+        console.error('Failed to getFile from current message for trim:', err)
+      }
     }
+
+    const reply = message.reply_to_message
+    if (!url && reply) {
+      const replyFileId = reply.video?.file_id ||
+        (reply.document?.mime_type?.startsWith('video/') ? reply.document.file_id : undefined) ||
+        reply.animation?.file_id
+
+      if (replyFileId && env.BOT_TOKEN) {
+        try {
+          const fileInfo = await tg.call<{ file_id: string; file_path?: string }>('getFile', { file_id: replyFileId })
+          if (fileInfo?.file_path) {
+            url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.file_path}`
+          }
+        } catch (err) {
+          console.error('Failed to getFile from reply message for trim:', err)
+        }
+      }
+
+      if (!url) {
+        const text = reply.text || reply.caption || ''
+        const urlMatch = text.match(/https?:\/\/[^\s]+/)
+        if (urlMatch) url = urlMatch[0]
+      }
+    }
+  }
+
+  if (/gofile\.io\/d\//i.test(url)) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: lang === 'ar'
+        ? `⚠️ <b>تنبيه بخصوص رابط Gofile:</b>\n\n` +
+          `الرابط المرسل (<code>${escapeHtml(url)}</code>) هو صفحة عرض وتنزيل ويب وليس رابط تدفق فيديو مباشر لـ ffmpeg.\n\n` +
+          `💡 <b>طريقة القص أو الاستخراج الصحيحة:</b>\n` +
+          `1. <b>إذا كان الفيديو في تيليجرام:</b> اعمل رد (Reply) مباشرة على رسالة الفيديو واكتب: <code>/trim ${escapeHtml(start)} ${escapeHtml(end)}</code>.\n` +
+          `2. <b>إذا حملته من Gofile:</b> افتح الصفحة بالمتصفح واضغط كليك يمين على زر Download واختر <i>Copy link address</i> (نسخ عنوان الرابط المباشر المنتهي بـ mp4) واستخدمه هنا.`
+        : `⚠️ <b>Gofile URL is a web viewer page, not a direct video stream:</b>\n\nPlease reply directly to the video in Telegram or right-click the Download button on Gofile and copy the direct stream link.`,
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
   }
 
   if (!start || !end || !url) {
@@ -1074,6 +1126,22 @@ async function handleFrameCommand(
         if (urlMatch) url = urlMatch[0]
       }
     }
+  }
+
+  if (url && /gofile\.io\/d\//i.test(url)) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: lang === 'ar'
+        ? `⚠️ <b>تنبيه بخصوص رابط Gofile:</b>\n\n` +
+          `الرابط المرسل (<code>${escapeHtml(url)}</code>) هو صفحة عرض وتنزيل ويب وليس رابط تدفق فيديو مباشر لـ ffmpeg.\n\n` +
+          `💡 <b>طريقة استخراج الفريمات الصحيحة:</b>\n` +
+          `1. <b>إذا كان الفيديو في تيليجرام:</b> اعمل رد (Reply) مباشرة على رسالة الفيديو واكتب: <code>/frame ${escapeHtml(start || '00:01')}-${escapeHtml(end || '00:20')}</code>.\n` +
+          `2. <b>إذا حملته من Gofile:</b> افتح الصفحة بالمتصفح واضغط كليك يمين على زر Download واختر <i>Copy link address</i> (نسخ عنوان الرابط المباشر المنتهي بـ mp4) واستخدمه هنا.`
+        : `⚠️ <b>Gofile URL is a web viewer page, not a direct video stream:</b>\n\nPlease reply directly to the video in Telegram or right-click the Download button on Gofile and copy the direct stream link.`,
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
   }
 
   if (!start || !end || !url) {
