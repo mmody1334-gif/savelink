@@ -36,6 +36,7 @@ export interface TgMessage {
   audio?: TgFileRef
   video?: TgFileRef
   document?: TgFileRef
+  animation?: TgFileRef
   photo?: TgPhotoSize[]
 }
 

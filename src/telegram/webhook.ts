@@ -205,6 +205,8 @@ interface TgMessage {
   voice?: TgFileRef
   audio?: TgFileRef
   video?: TgFileRef
+  document?: TgFileRef
+  animation?: TgFileRef
 }
 
 export async function telegramWebhook(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -631,6 +633,11 @@ async function handleCommand(
       await handleTrimCommand(tg, message, rest, lang, env)
       return
     }
+    case 'frame':
+    case 'frames': {
+      await handleFrameCommand(tg, message, rest, lang, env)
+      return
+    }
     case 'movie':
     case 'film':
     case 'series':
@@ -959,6 +966,217 @@ async function handleTrimCommand(
       chat_id: chatId,
       message_id: statusMsg.message_id,
       text: `❌ تعذر بدء القص: ${escapeHtml(e.message)}`,
+      parse_mode: 'HTML',
+    })
+  }
+}
+
+export function parseFrameCommandArgs(rest: string): { start: string; end: string; url: string } | null {
+  const trimmed = rest.trim()
+  if (!trimmed) return null
+
+  // 1. Hyphenated range: "00:01-0:20 [url]" or "00:01 - 0:20 [url]"
+  const hyphenMatch = trimmed.match(/^(\d{1,2}(?::\d{1,2}){0,2})\s*-\s*(\d{1,2}(?::\d{1,2}){0,2})(?:\s+([\s\S]*))?$/)
+  if (hyphenMatch) {
+    return {
+      start: hyphenMatch[1],
+      end: hyphenMatch[2],
+      url: hyphenMatch[3]?.trim() || '',
+    }
+  }
+
+  // 2. Space-separated: "00:01 0:20 [url]"
+  const spaceMatch = trimmed.match(/^(\d{1,2}(?::\d{1,2}){0,2})\s+(\d{1,2}(?::\d{1,2}){0,2})(?:\s+([\s\S]*))?$/)
+  if (spaceMatch) {
+    return {
+      start: spaceMatch[1],
+      end: spaceMatch[2],
+      url: spaceMatch[3]?.trim() || '',
+    }
+  }
+
+  return null
+}
+
+export function parseTimestampSeconds(ts: string): number {
+  const parts = ts.trim().split(':').map(Number)
+  if (parts.some(isNaN)) return 0
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
+  if (parts.length === 2) return parts[0] * 60 + parts[1]
+  if (parts.length === 1) return parts[0]
+  return 0
+}
+
+async function handleFrameCommand(
+  tg: TelegramApi,
+  message: TgMessage,
+  rest: string,
+  lang: Lang,
+  env: Env,
+): Promise<void> {
+  const chatId = message.chat.id
+  const token = env.GITHUB_TOKEN
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+
+  if (!token) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: lang === 'ar' ? '⚠️ خدمة استخراج الفريمات غير مهيأة.' : '⚠️ Frame extraction service not configured.',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
+
+  const parsed = parseFrameCommandArgs(rest)
+  let start = parsed?.start || ''
+  let end = parsed?.end || ''
+  let url = parsed?.url || ''
+
+  // If URL not in arguments, try current message or reply
+  if (!url) {
+    // 1. Current message video/document/animation
+    const curFileId = message.video?.file_id || 
+      (message.document?.mime_type?.startsWith('video/') ? message.document.file_id : undefined) ||
+      message.animation?.file_id
+
+    if (curFileId && env.BOT_TOKEN) {
+      try {
+        const fileInfo = await tg.call<{ file_id: string; file_path?: string }>('getFile', { file_id: curFileId })
+        if (fileInfo?.file_path) {
+          url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.file_path}`
+        }
+      } catch (err) {
+        console.error('Failed to getFile from current message:', err)
+      }
+    }
+
+    // 2. Replied message
+    const reply = message.reply_to_message
+    if (!url && reply) {
+      const replyFileId = reply.video?.file_id ||
+        (reply.document?.mime_type?.startsWith('video/') ? reply.document.file_id : undefined) ||
+        reply.animation?.file_id
+
+      if (replyFileId && env.BOT_TOKEN) {
+        try {
+          const fileInfo = await tg.call<{ file_id: string; file_path?: string }>('getFile', { file_id: replyFileId })
+          if (fileInfo?.file_path) {
+            url = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${fileInfo.file_path}`
+          }
+        } catch (err) {
+          console.error('Failed to getFile from reply message:', err)
+        }
+      }
+
+      if (!url) {
+        const replyText = reply.text || reply.caption || ''
+        const urlMatch = replyText.match(/https?:\/\/[^\s]+/)
+        if (urlMatch) url = urlMatch[0]
+      }
+    }
+  }
+
+  if (!start || !end || !url) {
+    const helpMsg = lang === 'ar'
+      ? `🎞️ <b>أداة استخراج فريمات الفيديو الحرفية (/frame)</b>\n\n` +
+        `تستخرج <b>كل فريم في الفيديو حرفياً</b> بدون تفويت أي لقطة، وترسل لك ألبوم معاينة فورية + ملف ZIP كامل بجميع الصور بدقتها الأصلية!\n\n` +
+        `<b>طرق الاستخدام:</b>\n` +
+        `1. <b>بالرد (Reply) على أي فيديو أو رابط:</b>\n` +
+        `<code>/frame 00:01-0:20</code>\n` +
+        `أو بالمسافة:\n` +
+        `<code>/frame 00:01 00:20</code>\n\n` +
+        `2. <b>كـ Caption مع فيديو ترسله للبوت مباشرة:</b>\n` +
+        `اكتب في الوصف: <code>/frame 00:00-00:15</code>\n\n` +
+        `3. <b>مع رابط الفيديو مباشرة:</b>\n` +
+        `<code>/frame 00:01-0:20 https://pixeldrain.com/u/...</code>\n\n` +
+        `💡 <i>أقصى مدة للنطاق الزمني هي 60 ثانية لضمان سرعة المعالجة وجودة الملفات.</i>`
+      : `🎞️ <b>Cloud Video Frame Extractor (/frame)</b>\n\n` +
+        `Extracts <b>every single video frame literally</b> in the specified range and sends a preview album + full ZIP archive!\n\n` +
+        `<b>Usage:</b>\n` +
+        `1. Reply to video/link:\n` +
+        `<code>/frame 00:01-0:20</code>\n\n` +
+        `2. Direct URL:\n` +
+        `<code>/frame 00:01-0:20 https://...</code>\n\n` +
+        `3. Send as caption with uploaded video:\n` +
+        `<code>/frame 00:00-00:10</code>`
+
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: helpMsg,
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
+
+  const startSec = parseTimestampSeconds(start)
+  const endSec = parseTimestampSeconds(end)
+  const durationSec = endSec - startSec
+
+  if (durationSec <= 0) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: lang === 'ar'
+        ? `❌ <b>خطأ في التوقيت:</b> وقت النهاية (<code>${escapeHtml(end)}</code>) يجب أن يكون أكبر من وقت البداية (<code>${escapeHtml(start)}</code>).`
+        : `❌ <b>Time error:</b> End time must be greater than start time.`,
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
+
+  if (durationSec > 60) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text: lang === 'ar'
+        ? `⚠️ <b>تنبيه:</b> أقصى فترة مسموحة لاستخراج جميع الفريمات حرفياً هي <b>60 ثانية</b> (الفترة المطلوبة: ${Math.round(durationSec)} ثانية).\nيرجى تحديد نطاق زمني أقل من دقيقة لضمان سرعة المعالجة وتفادي تضخم حجم الملف.`
+        : `⚠️ <b>Limit reached:</b> Maximum time window for literal frame extraction is 60 seconds (requested: ${Math.round(durationSec)}s). Please choose a shorter range.`,
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
+
+  const statusMsg = await tg.call<{ message_id: number }>('sendMessage', {
+    chat_id: chatId,
+    text: lang === 'ar'
+      ? `⏳ <b>جاري استخراج جميع فريمات الفيديو سحابياً…</b>\n⏱️ الفترة: من <code>${escapeHtml(start)}</code> إلى <code>${escapeHtml(end)}</code> (${Math.round(durationSec)} ثانية)\n🖼️ سيتم إرسال ألبوم المعاينة وملف الـ ZIP الكامل فور اكتمال الاستخراج.`
+      : `⏳ Extracting all video frames in cloud (from ${escapeHtml(start)} to ${escapeHtml(end)})…`,
+    parse_mode: 'HTML',
+    reply_to_message_id: message.message_id,
+  })
+
+  try {
+    const dispatchUrl = `https://api.github.com/repos/${repo}/actions/workflows/frame.yml/dispatches`
+    const res = await fetch(dispatchUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: 'application/vnd.github.v3+json',
+        'User-Agent': 'SaveLink-Telegram-Bot',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ref: 'main',
+        inputs: {
+          url,
+          start,
+          end,
+          chat_id: String(chatId),
+          bot_token: env.BOT_TOKEN || '',
+        },
+      }),
+    })
+
+    if (!res.ok && res.status !== 204) {
+      const err = await res.text()
+      throw new Error(`GitHub error: ${err}`)
+    }
+  } catch (e: any) {
+    await tg.safeEdit('editMessageText', {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: `❌ تعذر بدء استخراج الفريمات: ${escapeHtml(e.message)}`,
       parse_mode: 'HTML',
     })
   }
@@ -5060,6 +5278,10 @@ async function handleMenuCallback(
   } else if (target === 'tools') {
     text = lang === 'ar'
       ? `✂️ <b>أدوات الميديا الإضافية (Media Tools):</b>\n\n` +
+        `• <b>استخراج جميع فريمات الفيديو الحرفية:</b>\n` +
+        `<code>/frame <بداية>-<نهاية> [رابط]</code>\n` +
+        `مثال: <code>/frame 00:01-0:20 https://...</code>\n` +
+        `أو رد على أي فيديو مرسل في الشات بـ <code>/frame 00:00-00:15</code> لاستخراج كل فريم وإرسال ألبوم معاينة + ملف ZIP كامل بكل الصور بدقتها الأصلية!\n\n` +
         `• <b>قص الفيديو السحابي:</b>\n` +
         `<code>/trim <بداية> <نهاية> [رابط]</code>\n` +
         `مثال: <code>/trim 00:01:00 00:02:30 https://...</code>\n` +
@@ -5067,6 +5289,9 @@ async function handleMenuCallback(
         `• <b>استخراج الصوت:</b> <code>/mp3 [رابط]</code> لتحويل أي فيديو لصوت.\n` +
         `• <b>قائمة المراقبة:</b> <code>/watchlist</code> لمراجعة الحسابات المسجلة بالمراقبة التلقائية، و <code>/unwatch <حساب></code> لإلغاء المراقبة.`
       : `✂️ <b>Media Tools:</b>\n\n` +
+        `• <b>Literal Video Frame Extractor:</b>\n` +
+        `<code>/frame <start>-<end> [url]</code>\n` +
+        `Or reply to any video with <code>/frame 00:01-0:20</code> to extract all frames into ZIP + preview album.\n\n` +
         `• <b>Cloud Video Trimmer:</b>\n` +
         `<code>/trim <start> <end> [url]</code>\n` +
         `Or reply to any video with <code>/trim 00:00:10 00:01:00</code> to cut that segment.\n\n` +

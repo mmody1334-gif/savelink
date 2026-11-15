@@ -1,0 +1,47 @@
+name: Cloud Video Frame Extractor
+
+'on':
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Video URL to extract frames from'
+        required: true
+      start:
+        description: 'Start timestamp (e.g. 00:01:00 or seconds)'
+        required: true
+      end:
+        description: 'End timestamp (e.g. 00:02:30 or seconds)'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      bot_token:
+        description: 'Telegram Bot Token'
+        required: true
+
+jobs:
+  frame:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg curl
+
+      - name: Install Python Requirements
+        run: |
+          pip install --upgrade pip
+          pip install requests
+
+      - name: Extract Frames
+        run: |
+          python frame.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
