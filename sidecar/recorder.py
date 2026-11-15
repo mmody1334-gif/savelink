@@ -413,6 +413,32 @@ def parse_stream_target(target: str) -> Tuple[str, str, str]:
     return "universal", safe_slug, clean
 
 
+def ensure_faststart_streaming(file_path: Path) -> Path:
+    """Remuxes MP4 with faststart so moov atom is at beginning for instant web player streaming."""
+    if not file_path.exists() or file_path.stat().st_size < 50 * 1024:
+        return file_path
+    fast_tmp = file_path.with_name(f"fast_{file_path.name}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(file_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(fast_tmp),
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        if res.returncode == 0 and fast_tmp.exists() and fast_tmp.stat().st_size > 0:
+            file_path.unlink(missing_ok=True)
+            fast_tmp.rename(file_path)
+            logger.info(f"Faststart streaming optimization applied to {file_path.name}")
+    except Exception as e:
+        logger.warning(f"Faststart optimization skipped: {e}")
+    return file_path
+
+
 def upload_to_gofile(file_path: Path) -> Optional[str]:
     """Uploads to Gofile (supports unlimited size, fast & reliable)."""
     try:
@@ -430,7 +456,7 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
             "curl",
             "-s",
             "-X", "POST",
-            "-F", f"file=@{str(file_path)}",
+            "-F", f"file=@{str(file_path)};type=video/mp4",
             upload_url,
         ]
         res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
@@ -1035,6 +1061,9 @@ class RecordingJob:
         duration_str = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
 
         logger.info(f"Recording finished for {self.identifier} on {platform_name}: {size_str}, uploading...")
+
+        # Optimize container for instant in-browser streaming (FastStart)
+        self.output_path = ensure_faststart_streaming(self.output_path)
 
         # 1. Try Gofile (fast, reliable, no size limit)
         download_url = upload_to_gofile(self.output_path)

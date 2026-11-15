@@ -23,6 +23,32 @@ MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./recordings_data"))
 RECORDINGS_DIR = MEDIA_DIR / "recordings"
 
 
+def ensure_faststart_streaming(file_path: Path) -> Path:
+    """Remuxes MP4 with faststart so moov atom is at beginning for instant web player streaming."""
+    if not file_path.exists() or file_path.stat().st_size < 50 * 1024:
+        return file_path
+    fast_tmp = file_path.with_name(f"fast_{file_path.name}")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(file_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(fast_tmp),
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        if res.returncode == 0 and fast_tmp.exists() and fast_tmp.stat().st_size > 0:
+            file_path.unlink(missing_ok=True)
+            fast_tmp.rename(file_path)
+            logger.info(f"Faststart streaming optimization applied to {file_path.name}")
+    except Exception as e:
+        logger.warning(f"Faststart optimization skipped: {e}")
+    return file_path
+
+
 def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
     try:
         filename = file_path.name
@@ -55,7 +81,7 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
         with open(file_path, "rb") as f:
             up_resp = requests.post(
                 f"https://{server}.gofile.io/contents/uploadfile",
-                files={"file": (file_path.name, f)},
+                files={"file": (file_path.name, f, "video/mp4")},
                 timeout=600,
             )
             up_data = up_resp.json()
@@ -174,6 +200,7 @@ def main():
         size_str = f"{size_mb:.1f} MB" if size_mb < 1024 else f"{(size_mb / 1024):.2f} GB"
 
         logger.info(f"Uploading remaining file: {mp4.name} ({size_str})...")
+        mp4 = ensure_faststart_streaming(mp4)
         download_url = upload_to_gofile(mp4)
         if not download_url:
             download_url = upload_to_pixeldrain(mp4)
