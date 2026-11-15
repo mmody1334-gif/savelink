@@ -2,6 +2,15 @@ import { Hono } from 'hono'
 import { ENGINES } from '../engines'
 import { getStore } from '../store'
 import type { Env } from '../types'
+import {
+  parseWatchTarget,
+  checkTargetLive,
+  watchLockKey,
+  clearWatchLock,
+  clearAllWatchLocksForTarget,
+  runWatchCycle,
+  type WatchTarget,
+} from '../watch'
 
 export const apiRoute = new Hono<{ Bindings: Env }>()
 
@@ -29,9 +38,15 @@ apiRoute.get('/record/signal', async (c) => {
 
 apiRoute.get('/record/signal/clear', async (c) => {
   const target = (c.req.query('target') || '').toLowerCase().trim().replace(/^@/, '')
+  const platform = (c.req.query('platform') || '').toLowerCase().trim()
   if (target) {
     const store = getStore(c.env)
     await store.delete(`stop:${target}`)
+    if (platform) {
+      await clearWatchLock(store, platform, target)
+    } else {
+      await clearAllWatchLocksForTarget(store, target)
+    }
   }
   return c.json({ ok: true })
 })
@@ -43,4 +58,63 @@ apiRoute.post('/record/stop', async (c) => {
   const store = getStore(c.env)
   await store.put(`stop:${target}`, '1', 3600)
   return c.json({ ok: true, message: 'Stop signal sent' })
+})
+
+apiRoute.get('/watch/check', async (c) => {
+  const raw = c.req.query('target') || c.req.query('model') || ''
+  const plat = c.req.query('platform') || ''
+  if (!raw) return c.json({ ok: false, error: 'Target query param required' }, 400)
+
+  const parsed = parseWatchTarget(raw)
+  const platform = (plat || parsed?.platform || 'chaturbate') as any
+  const identifier = parsed?.identifier || raw.toLowerCase().trim().replace(/^@/, '')
+
+  const target: WatchTarget = {
+    chatId: 0,
+    target: raw,
+    platform,
+    identifier,
+    addedAt: 0,
+  }
+
+  const store = getStore(c.env)
+  const check = await checkTargetLive(target)
+  const lockKey = watchLockKey(platform, identifier)
+  const locked = Boolean(await store.get(lockKey))
+
+  return c.json({
+    ok: true,
+    platform,
+    identifier,
+    state: check.state,
+    detail: check.detail,
+    recordable: check.recordable ?? false,
+    viewers: check.viewers,
+    hls: check.hls,
+    locked,
+  })
+})
+
+apiRoute.get('/watch/status', async (c) => {
+  const store = getStore(c.env)
+  const indexRaw = await store.get('watch:index:all')
+  const targets: WatchTarget[] = indexRaw ? JSON.parse(indexRaw) : []
+  const enriched = await Promise.all(
+    targets.map(async (t) => {
+      const lockKey = watchLockKey(t.platform, t.identifier)
+      const lockVal = await store.get(lockKey)
+      return {
+        ...t,
+        locked: Boolean(lockVal),
+        lockTime: lockVal ? Number(lockVal) : null,
+      }
+    }),
+  )
+  return c.json({ ok: true, count: enriched.length, targets: enriched })
+})
+
+apiRoute.all('/watch/cycle', async (c) => {
+  const store = getStore(c.env)
+  const result = await runWatchCycle(c.env, store)
+  return c.json({ ok: true, cycle: result })
 })

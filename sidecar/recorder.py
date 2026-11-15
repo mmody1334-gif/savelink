@@ -572,12 +572,13 @@ def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url:
 
 
 class RecordingJob:
-    def __init__(self, platform: str, identifier: str, stream_url: str, chat_id: int | str, bot_token: str = ""):
+    def __init__(self, platform: str, identifier: str, stream_url: str, chat_id: int | str, bot_token: str = "", watch_mode: bool = False):
         self.platform = platform
         self.identifier = identifier
         self.stream_url = stream_url
         self.chat_id = chat_id
         self.bot_token = bot_token
+        self.watch_mode = watch_mode
         self.start_time = time.time()
         self.stop_requested = False
         self.process: Optional[subprocess.Popen] = None
@@ -720,38 +721,71 @@ class RecordingJob:
             info = resolve_chaturbate_stream(self.identifier)
             cb_room_status = info.get("room_status", "unknown")
 
-            # If in Private Show or Away, wait up to 45 minutes for public stream to resume
-            if not info.get("ok") and cb_room_status in ("private", "away", "hidden"):
-                status_ar = "عرض خاص (Private Show)" if cb_room_status == "private" else "استراحة قصيرة (Away)"
-                logger.info(f"{self.identifier} is currently in {cb_room_status}. Waiting automatically for public stream...")
-                notify_telegram(
-                    self.bot_token,
-                    self.chat_id,
-                    f"⏳ <b>الحساب <code>{self.identifier}</code> في {status_ar} حالياً!</b>\n\n"
-                    f"🔄 السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً وبأعلى دقة (1080p) فور انتهاء العرض الخاص دون أي تدخل منك!",
-                )
-                for _ in range(180):  # 180 * 15s = 45 minutes
-                    if self.stop_requested:
-                        break
-                    for _ in range(15):
+            # Watch mode for offline creators or Private/Away wait loop
+            if not info.get("ok"):
+                is_offline = cb_room_status in ("offline", "no_such_room", "unknown", "")
+                if is_offline and self.watch_mode:
+                    logger.info(f"{self.identifier} is currently {cb_room_status}. Watch mode active: polling every 20s for public broadcast...")
+                    notify_telegram(
+                        self.bot_token,
+                        self.chat_id,
+                        f"👁️ <b>بدأت المراقبة السحابية الذكية (Cloud Watcher)!</b>\n\n"
+                        f"👤 <b>الحساب:</b> <code>{self.identifier}</code> (Chaturbate)\n"
+                        f"📡 <b>الحالة الآن:</b> غير مباشر ({cb_room_status}).\n"
+                        f"🔄 السيرفر يفحص الحساب في الخلفية كل 20 ثانية، وفور أن تبدأ البث العام سيبدأ التسجيل فوراً دون أي تدخل منك!",
+                    )
+                    # Loop up to 5.5 hours (990 * 20s = 19,800s)
+                    for _ in range(990):
                         if self.stop_requested:
                             break
-                        time.sleep(1)
-                    if self.stop_requested:
-                        break
-                    info = resolve_chaturbate_stream(self.identifier)
-                    cb_room_status = info.get("room_status", cb_room_status)
-                    if info.get("ok"):
-                        logger.info(f"{self.identifier} is now PUBLIC! Starting recording...")
-                        notify_telegram(
-                            self.bot_token,
-                            self.chat_id,
-                            f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
-                        )
-                        self.start_time = time.time()
-                        break
-                    if cb_room_status == "offline":
-                        break
+                        for _ in range(20):
+                            if self.stop_requested:
+                                break
+                            time.sleep(1)
+                        if self.stop_requested:
+                            break
+                        info = resolve_chaturbate_stream(self.identifier)
+                        cb_room_status = info.get("room_status", cb_room_status)
+                        if info.get("ok"):
+                            logger.info(f"{self.identifier} is now LIVE! Starting recording...")
+                            notify_telegram(
+                                self.bot_token,
+                                self.chat_id,
+                                f"🟢 <b>بدأ البث المباشر الآن لحساب <code>{self.identifier}</code>! بدأ التسجيل السحابي فوراً...</b>",
+                            )
+                            self.start_time = time.time()
+                            break
+                elif cb_room_status in ("private", "away", "hidden"):
+                    status_ar = "عرض خاص (Private Show)" if cb_room_status == "private" else "استراحة قصيرة (Away)"
+                    logger.info(f"{self.identifier} is currently in {cb_room_status}. Waiting automatically for public stream...")
+                    notify_telegram(
+                        self.bot_token,
+                        self.chat_id,
+                        f"⏳ <b>الحساب <code>{self.identifier}</code> في {status_ar} حالياً!</b>\n\n"
+                        f"🔄 السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً وبأعلى دقة (1080p) فور انتهاء العرض الخاص دون أي تدخل منك!",
+                    )
+                    for _ in range(180):  # 180 * 15s = 45 minutes
+                        if self.stop_requested:
+                            break
+                        for _ in range(15):
+                            if self.stop_requested:
+                                break
+                            time.sleep(1)
+                        if self.stop_requested:
+                            break
+                        info = resolve_chaturbate_stream(self.identifier)
+                        cb_room_status = info.get("room_status", cb_room_status)
+                        if info.get("ok"):
+                            logger.info(f"{self.identifier} is now PUBLIC! Starting recording...")
+                            notify_telegram(
+                                self.bot_token,
+                                self.chat_id,
+                                f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
+                            )
+                            self.start_time = time.time()
+                            break
+                        if cb_room_status == "offline" and not self.watch_mode:
+                            break
 
             cb_target_url = f"https://chaturbate.com/{self.identifier}/"
 
@@ -941,6 +975,29 @@ class RecordingJob:
                             break
                         if status_detail == "offline":
                             break
+                elif not resolved_stream and self.watch_mode:
+                    logger.info(f"{self.identifier} is currently {status_detail}. Watch mode active: polling every 20s...")
+                    notify_telegram(
+                        self.bot_token,
+                        self.chat_id,
+                        f"👁️ <b>بدأت المراقبة السحابية الذكية (Cloud Watcher)!</b>\n\n"
+                        f"👤 <b>الحساب:</b> <code>{self.identifier}</code> (Stripchat)\n"
+                        f"📡 <b>الحالة الآن:</b> غير مباشر ({status_detail}).\n"
+                        f"🔄 السيرفر يفحص الحساب في الخلفية كل 20 ثانية، وفور أن تبدأ البث العام سيبدأ التسجيل فوراً!",
+                    )
+                    for _ in range(990):
+                        if self.stop_requested:
+                            break
+                        time.sleep(20)
+                        resolved_stream, status_detail = _try_extract_stream(self.stream_url)
+                        if resolved_stream:
+                            notify_telegram(
+                                self.bot_token,
+                                self.chat_id,
+                                f"🟢 <b>بدأ البث المباشر الآن لحساب <code>{self.identifier}</code>! بدأ التسجيل السحابي فوراً...</b>",
+                            )
+                            self.start_time = time.time()
+                            break
 
             target_stream = resolved_stream or self.stream_url
 
@@ -999,10 +1056,10 @@ class RecordingJob:
                 except Exception as e:
                     logger.warning(f"streamlink direct recording error: {e}")
 
-        # Clear stop signal in worker so future recordings are unaffected
+        # Clear stop signal and watch locks in worker so future recordings are unaffected
         try:
             worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
-            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
+            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}&platform={urllib.parse.quote(self.platform)}"
             req = urllib.request.Request(clear_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 resp.read()
@@ -1181,6 +1238,7 @@ if __name__ == "__main__":
     cli_target = sys.argv[1]
     cli_chat = sys.argv[2]
     cli_token = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BOT_TOKEN", "")
+    cli_watch = (sys.argv[4] if len(sys.argv) > 4 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
 
     platform, identifier, stream_url = parse_stream_target(cli_target)
     if platform == "unknown":
@@ -1188,8 +1246,8 @@ if __name__ == "__main__":
         identifier = re.sub(r"[^a-zA-Z0-9_-]", "_", cli_target)[:40] or "stream"
         stream_url = cli_target
 
-    print(f"Starting CLI recording for {identifier} on {platform} (chat_id: {cli_chat})...", flush=True)
-    cli_job = RecordingJob(platform, identifier, stream_url, cli_chat, cli_token)
+    print(f"Starting CLI recording for {identifier} on {platform} (chat_id: {cli_chat}, watch_mode: {cli_watch})...", flush=True)
+    cli_job = RecordingJob(platform, identifier, stream_url, cli_chat, cli_token, watch_mode=cli_watch)
 
     def _sig_handler(sig, frame):
         print("\nInterrupt received, stopping recording and uploading...", flush=True)

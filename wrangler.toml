@@ -28,7 +28,7 @@ GITHUB_RECORDER_REPO = "mmody1334-gif/cb-recorder"
 enabled = true
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/2 * * * *"]
 
 # Persistent state: button payloads, result cache and rate limits survive
 # isolate restarts. Free plan includes 100k reads + 1k writes per day.

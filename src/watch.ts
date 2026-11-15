@@ -24,6 +24,23 @@ const CHECK_TIMEOUT_MS = 8_000
 const MAX_PARALLEL = 6
 const SESSION_LOCK_SECONDS = 7200
 
+export function watchLockKey(platform: string, identifier: string): string {
+  return `watch:lock:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
+}
+
+export async function clearWatchLock(store: Store, platform: string, identifier: string): Promise<void> {
+  await store.delete(watchLockKey(platform, identifier))
+}
+
+export async function clearAllWatchLocksForTarget(store: Store, target: string): Promise<void> {
+  const clean = target.toLowerCase().trim().replace(/^@/, '')
+  await Promise.all([
+    store.delete(`watch:lock:chaturbate:${clean}`),
+    store.delete(`watch:lock:stripchat:${clean}`),
+    store.delete(`watch:lock:tiktok:${clean}`),
+  ])
+}
+
 export type LiveState = 'live' | 'offline' | 'unknown'
 
 export interface LiveCheck {
@@ -55,7 +72,10 @@ export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturb
   }
 
   // Chaturbate
-  const cb = clean.match(/chaturbate\.com\/(?:b\/)?([a-zA-Z0-9_.-]+)/i) || clean.match(/^([a-zA-Z0-9_.-]{3,60})$/)
+  const cb =
+    clean.match(/chaturbate\.com\/(?:b\/)?([a-zA-Z0-9_.-]+)/i) ||
+    clean.match(/^(?:cb|chaturbate)[:_]([a-zA-Z0-9_.-]+)$/i) ||
+    clean.match(/^([a-zA-Z0-9_.-]{3,60})$/)
   if (cb) {
     const id = cb[1].toLowerCase()
     return { platform: 'chaturbate', identifier: id, clean: id }
@@ -134,6 +154,13 @@ export async function removeWatchTarget(
     await store.put(WATCH_INDEX_KEY, JSON.stringify(newGlobal), WATCH_TTL_SECONDS)
   }
 
+  // Clear locks for this target so future watches or recordings start fresh
+  if (parsed) {
+    await clearWatchLock(store, parsed.platform, parsed.identifier)
+  } else {
+    await clearAllWatchLocksForTarget(store, targetStr)
+  }
+
   return { ok: true, count: removed }
 }
 
@@ -154,34 +181,90 @@ export async function checkTargetLive(target: WatchTarget): Promise<LiveCheck> {
   const id = target.identifier.replace(/^@/, '').toLowerCase()
 
   if (target.platform === 'chaturbate') {
+    const desktopUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+    let diag = ''
+
+    // Method 1: chatvideocontext API
     try {
       const res = await fetch(`https://chaturbate.com/api/chatvideocontext/${encodeURIComponent(id)}/`, {
-        headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+        headers: {
+          'User-Agent': desktopUa,
+          Accept: 'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
         signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
       })
       if (res.status === 404) return { state: 'unknown', detail: 'no_such_room' }
-      if (!res.ok) return { state: 'unknown', detail: `http_${res.status}` }
+      if (res.ok) {
+        const ct = res.headers.get('content-type') || ''
+        if (ct.includes('json')) {
+          const data: any = await res.json()
+          const status = String(data?.room_status ?? '').toLowerCase()
+          const hls = typeof data?.hls_source === 'string' ? data.hls_source : ''
+          const viewers = typeof data?.num_viewers === 'number' ? data.num_viewers : undefined
 
-      const ct = res.headers.get('content-type') || ''
-      if (!ct.includes('json')) return { state: 'unknown', detail: 'not_json' }
-
-      const data: any = await res.json()
-      const status = String(data?.room_status ?? '').toLowerCase()
-      const hls = typeof data?.hls_source === 'string' ? data.hls_source : ''
-      const viewers = typeof data?.num_viewers === 'number' ? data.num_viewers : undefined
-
-      if (!status) return { state: 'unknown', detail: 'no_room_status' }
-      const onAir = CB_ON_AIR.has(status) || Boolean(hls)
-      return {
-        state: onAir ? 'live' : 'offline',
-        detail: status || 'unknown',
-        hls: hls || undefined,
-        viewers,
-        recordable: Boolean(hls),
+          if (status) {
+            const onAir = CB_ON_AIR.has(status) || Boolean(hls)
+            return {
+              state: onAir ? 'live' : 'offline',
+              detail: status,
+              hls: hls || undefined,
+              viewers,
+              recordable: Boolean(hls) && status === 'public',
+            }
+          }
+        } else {
+          diag += `m1_ct:${ct.slice(0, 30)};`
+        }
+      } else {
+        diag += `m1_http:${res.status};`
       }
-    } catch (e) {
-      return { state: 'unknown', detail: `error:${(e as Error).name}` }
+    } catch (e1: any) {
+      diag += `m1_err:${e1?.name || e1?.message};`
     }
+
+    // Method 2: get_edge_hls_url_ajax POST endpoint
+    try {
+      const res2 = await fetch(`https://chaturbate.com/get_edge_hls_url_ajax/`, {
+        method: 'POST',
+        headers: {
+          'User-Agent': desktopUa,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-Requested-With': 'XMLHttpRequest',
+          Origin: 'https://chaturbate.com',
+          Referer: `https://chaturbate.com/${encodeURIComponent(id)}/`,
+          Accept: 'application/json, text/javascript, */*; q=0.01',
+        },
+        body: `room_slug=${encodeURIComponent(id)}`,
+        signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+      })
+      if (res2.ok) {
+        const ct2 = res2.headers.get('content-type') || ''
+        if (ct2.includes('json')) {
+          const data2: any = await res2.json()
+          const status2 = String(data2?.room_status ?? '').toLowerCase()
+          const url2 = typeof data2?.url === 'string' ? data2.url : ''
+          if (status2) {
+            const onAir2 = CB_ON_AIR.has(status2) || Boolean(url2)
+            return {
+              state: onAir2 ? 'live' : 'offline',
+              detail: status2,
+              hls: url2 || undefined,
+              recordable: Boolean(url2) && (status2 === 'public' || status2 === ''),
+            }
+          }
+        } else {
+          diag += `m2_ct:${ct2.slice(0, 30)};`
+        }
+      } else {
+        diag += `m2_http:${res2.status};`
+      }
+    } catch (e2: any) {
+      diag += `m2_err:${e2?.name || e2?.message};`
+    }
+
+    return { state: 'unknown', detail: diag || 'chaturbate_unreachable' }
   }
 
   if (target.platform === 'stripchat') {
@@ -252,7 +335,7 @@ function recorderTargetParam(t: WatchTarget): string {
   return t.identifier
 }
 
-async function dispatchRecorder(env: Env, t: WatchTarget): Promise<{ ok: boolean; status: number; body: string }> {
+async function dispatchRecorder(env: Env, t: WatchTarget, watchMode = '1'): Promise<{ ok: boolean; status: number; body: string }> {
   const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
   const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`, {
     method: 'POST',
@@ -268,6 +351,7 @@ async function dispatchRecorder(env: Env, t: WatchTarget): Promise<{ ok: boolean
         model: recorderTargetParam(t),
         chat_id: String(t.chatId),
         bot_token: env.BOT_TOKEN || '',
+        watch_mode: watchMode,
       },
     }),
   })
@@ -281,22 +365,30 @@ export async function triggerWatchTargetIfLive(
   t: WatchTarget,
 ): Promise<{ live: boolean; triggered: boolean; detail: string }> {
   if (!env.GITHUB_TOKEN) return { live: false, triggered: false, detail: 'no_github_token' }
-  const check = await checkTargetLive(t)
-  if (check.state !== 'live') {
-    return { live: false, triggered: false, detail: check.detail }
-  }
 
-  const lockKey = `watch:lock:${t.platform}:${t.identifier}`
+  const lockKey = watchLockKey(t.platform, t.identifier)
   if (await store.get(lockKey)) {
     return { live: true, triggered: false, detail: 'already_recording' }
   }
 
-  const dispatch = await dispatchRecorder(env, t)
+  const check = await checkTargetLive(t)
+  if (check.state === 'live') {
+    const dispatch = await dispatchRecorder(env, t, '1')
+    if (dispatch.ok) {
+      await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+      return { live: true, triggered: true, detail: check.detail }
+    }
+    return { live: true, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
+  }
+
+  // Cloud Watcher dispatch for platforms where direct edge probes might be blocked
+  const dispatch = await dispatchRecorder(env, t, '1')
   if (dispatch.ok) {
     await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
-    return { live: true, triggered: true, detail: check.detail }
+    return { live: false, triggered: true, detail: check.detail || 'cloud_watcher_dispatched' }
   }
-  return { live: true, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
+
+  return { live: false, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
 }
 
 export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: number; triggered: number; unknown: number }> {
@@ -349,12 +441,44 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
       )
 
       if (check.state === 'unknown') {
-        unknown++
+        if (check.detail === 'no_such_room') {
+          const lockKey = watchLockKey(t.platform, t.identifier)
+          if (await store.get(lockKey)) {
+            await store.delete(lockKey)
+            console.log(`[watch] ${t.platform}/${t.identifier} room not found - cleared lock`)
+          }
+          unknown++
+          continue
+        }
+
+        // If Chaturbate or Stripchat hits edge WAF (403/418), dispatch the Cloud Watcher
+        // on GitHub Actions where curl_cffi runs with full browser TLS impersonation.
+        const lockKey = watchLockKey(t.platform, t.identifier)
+        if (await store.get(lockKey)) {
+          continue
+        }
+        try {
+          const dispatch = await dispatchRecorder(env, t, '1')
+          if (dispatch.ok) {
+            await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+            triggered++
+            console.log(`[watch] dispatched cloud watcher for ${t.platform}/${t.identifier}`)
+          }
+        } catch (e) {
+          console.error(`[watch] cloud watcher dispatch error:`, e)
+        }
         continue
       }
-      if (check.state === 'offline') continue
+      if (check.state === 'offline') {
+        const lockKey = watchLockKey(t.platform, t.identifier)
+        if (await store.get(lockKey)) {
+          await store.delete(lockKey)
+          console.log(`[watch] ${t.platform}/${t.identifier} is offline - auto-cleared lock`)
+        }
+        continue
+      }
 
-      const lockKey = `watch:lock:${t.platform}:${t.identifier}`
+      const lockKey = watchLockKey(t.platform, t.identifier)
       if (await store.get(lockKey)) continue
 
       try {

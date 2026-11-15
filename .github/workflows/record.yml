@@ -12,6 +12,10 @@ on:
       bot_token:
         description: 'Telegram Bot Token'
         required: true
+      watch_mode:
+        description: 'Watch mode: wait for stream if offline'
+        required: false
+        default: '0'
 
 jobs:
   record:
@@ -38,7 +42,7 @@ jobs:
 
       - name: Record Stream
         run: |
-          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}" "${{ github.event.inputs.watch_mode }}"
 
       - name: Backup Uploader (Always Runs)
         if: always()

@@ -710,18 +710,8 @@ async function handleWatchCommand(
   }
 
   const res = await addWatchTarget(chatId, rest, store)
-  if (!res.ok) {
-    if (res.error === 'already_watched') {
-      await tg.call('sendMessage', {
-        chat_id: chatId,
-        text: lang === 'ar'
-          ? `⚠️ الحساب <code>${escapeHtml(res.target?.target || rest)}</code> موجود بالفعل في قائمة المراقبة لديك!`
-          : `⚠️ Target <code>${escapeHtml(res.target?.target || rest)}</code> is already being watched!`,
-        parse_mode: 'HTML',
-        reply_to_message_id: message.message_id,
-      })
-      return
-    }
+  const isAlreadyWatched = !res.ok && res.error === 'already_watched'
+  if (!res.ok && !isAlreadyWatched) {
     await tg.call('sendMessage', {
       chat_id: chatId,
       text: lang === 'ar' ? '❌ تعذر إضافة الحساب، تأكد من صحة الاسم أو الرابط.' : '❌ Invalid target.',
@@ -730,20 +720,23 @@ async function handleWatchCommand(
     return
   }
 
-  const plat = res.target!.platform === 'tiktok' ? 'TikTok Live' : (res.target!.platform === 'stripchat' ? 'Stripchat' : 'Chaturbate')
+  const target = res.target!
+  const plat = target.platform === 'tiktok' ? 'TikTok Live' : (target.platform === 'stripchat' ? 'Stripchat' : 'Chaturbate')
 
-  // Immediate live check: if already live, dispatch recorder right now!
+  // Immediate live check: if live right now, dispatch recorder right now!
   try {
-    const liveTrigger = await triggerWatchTargetIfLive(env, store, res.target!)
+    const liveTrigger = await triggerWatchTargetIfLive(env, store, target)
     if (liveTrigger.triggered) {
       const liveMsg = lang === 'ar'
         ? `🟢 <b>الحساب مباشر (LIVE) الآن!</b>\n\n` +
-          `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-          `🎥 <b>تمت إضافته للمراقبة وبدأ التسجيل السحابي فوراً دون انتظار!</b>\n` +
+          `👤 <b>الحساب:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
+          (isAlreadyWatched
+            ? `🎥 <b>الحساب مسجل مسبقاً، وبدأ التسجيل السحابي فوراً دون انتظار!</b>\n`
+            : `🎥 <b>تمت إضافته للمراقبة وبدأ التسجيل السحابي فوراً دون انتظار!</b>\n`) +
           `📦 سيتم إرسال الفيديو لك فور انتهاء البث.`
         : `🟢 <b>Target is LIVE right now!</b>\n\n` +
-          `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-          `🎥 <b>Added to watch list & recording started immediately!</b>\n` +
+          `👤 <b>Target:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
+          `🎥 <b>Recording started immediately!</b>\n` +
           `📦 Video will be sent when broadcast ends.`
 
       await tg.call('sendMessage', {
@@ -758,13 +751,31 @@ async function handleWatchCommand(
     if (liveTrigger.live && liveTrigger.detail === 'already_recording') {
       const alreadyMsg = lang === 'ar'
         ? `🟢 <b>الحساب مباشر (LIVE) الآن، والتسجيل السحابي يعمل له بالفعل!</b>\n\n` +
-          `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+          `👤 <b>الحساب:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
           `📦 سيتم إرسال الفيديو فور اكتمال التسجيل.`
         : `🟢 <b>Target is LIVE and already recording!</b>`
 
       await tg.call('sendMessage', {
         chat_id: chatId,
         text: alreadyMsg,
+        parse_mode: 'HTML',
+        reply_to_message_id: message.message_id,
+      })
+      return
+    }
+
+    if (isAlreadyWatched) {
+      const alreadyOfflineMsg = lang === 'ar'
+        ? `ℹ️ <b>الحساب <code>${escapeHtml(target.target)}</code> موجود بالفعل في قائمة المراقبة لديك!</b>\n\n` +
+          `📡 <b>الحالة الآن:</b> غير مباشر (${escapeHtml(liveTrigger.detail || 'Offline')})\n` +
+          `⏱️ البوت يراقبه باستمرار في السحابة، وفور أن يفتح لايف سيبدأ التسجيل فوراً ويرسل لك إشعاراً.`
+        : `ℹ️ <b>Target <code>${escapeHtml(target.target)}</code> is already in your watchlist!</b>\n\n` +
+          `📡 <b>Current status:</b> Offline (${escapeHtml(liveTrigger.detail || 'Offline')})\n` +
+          `Will record automatically when live.`
+
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: alreadyOfflineMsg,
         parse_mode: 'HTML',
         reply_to_message_id: message.message_id,
       })
@@ -777,11 +788,11 @@ async function handleWatchCommand(
   const successMsg = lang === 'ar'
     ? `✅ <b>تمت الإضافة لقائمة المراقبة والتسجيل التلقائي!</b>\n\n` +
       `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-      `⏱️ <b>الفحص:</b> دوري كل 5 دقائق في السحابة\n` +
-      `🎥 <b>الإجراء:</b> الحساب غير مباشر حالياً، وأول ما يفتح لايف سيتم إشعارك وبدء التسجيل السحابي فوراً وجهازك مغلق.`
+      `⏱️ <b>الفحص:</b> فحص ذكي كل 20 ثانية في السحابة\n` +
+      `🎥 <b>الإجراء:</b> تم تشغيل المسجل السحابي في الخلفية — إذا كانت الموديل أونلاين سيسجل فوراً، وإذا كانت أوفلاين سيراقبها ويبدأ التسجيل تلقائياً أول ما تفتح لايف وجهازك مغلق!`
     : `✅ <b>Added to Auto-Record Watchlist!</b>\n\n` +
       `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-      `⏱️ <b>Interval:</b> Checked every 5 mins in cloud\n` +
+      `⏱️ <b>Interval:</b> Checked every 20 seconds in cloud\n` +
       `🎥 <b>Action:</b> Will record automatically when live.`
 
   await tg.call('sendMessage', {
