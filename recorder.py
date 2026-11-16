@@ -618,7 +618,11 @@ class RecordingJob:
                             return
                 except Exception:
                     pass
-            time.sleep(2)
+            # Ask the Worker every 40s (each poll costs a KV read on the free plan).
+            for _ in range(40):
+                if self.stop_requested or (self.process is not None and self.process.poll() is not None):
+                    return
+                time.sleep(1)
 
     def stop(self):
         self.stop_requested = True
