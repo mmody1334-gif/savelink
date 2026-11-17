@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { ENGINES } from '../engines'
 import { getStore } from '../store'
 import type { Env } from '../types'
@@ -14,6 +14,25 @@ import {
 } from '../watch'
 
 export const apiRoute = new Hono<{ Bindings: Env }>()
+
+/**
+ * The watch endpoints expose the full watchlist (targets + chat ids) and can
+ * trigger GitHub Actions runners, so they are not public. They accept the same
+ * shared secret as the Telegram webhook (WEBHOOK_SECRET) via the
+ * `x-telegram-bot-api-secret-token` header or `Authorization: Bearer <secret>`.
+ * Fail closed: without a configured secret, every call is refused.
+ */
+export function watchAuthOk(c: Context<{ Bindings: Env }>): boolean {
+  const secret = (c.env.WEBHOOK_SECRET || '').trim()
+  if (!secret) return false
+  const header = c.req.header('x-telegram-bot-api-secret-token') || ''
+  const bearer = c.req.header('authorization') || ''
+  return header === secret || bearer === `Bearer ${secret}`
+}
+
+function requireWatchAuth(c: Context<{ Bindings: Env }>): Response | null {
+  return watchAuthOk(c) ? null : c.json({ ok: false, error: 'unauthorized' }, 401)
+}
 
 // Global kill switch: while paused, every API route is refused except health,
 // and recorders polling /record/signal are told to stop.
@@ -72,6 +91,8 @@ apiRoute.post('/record/stop', async (c) => {
 })
 
 apiRoute.get('/watch/check', async (c) => {
+  const denied = requireWatchAuth(c)
+  if (denied) return denied
   const raw = c.req.query('target') || c.req.query('model') || ''
   const plat = c.req.query('platform') || ''
   if (!raw) return c.json({ ok: false, error: 'Target query param required' }, 400)
@@ -107,6 +128,8 @@ apiRoute.get('/watch/check', async (c) => {
 })
 
 apiRoute.get('/watch/status', async (c) => {
+  const denied = requireWatchAuth(c)
+  if (denied) return denied
   const store = getStore(c.env)
   const indexRaw = await store.get('watch:index:all')
   const targets: WatchTarget[] = indexRaw ? JSON.parse(indexRaw) : []
@@ -125,6 +148,8 @@ apiRoute.get('/watch/status', async (c) => {
 })
 
 apiRoute.all('/watch/cycle', async (c) => {
+  const denied = requireWatchAuth(c)
+  if (denied) return denied
   const store = getStore(c.env)
   const result = await runWatchCycle(c.env, store)
   return c.json({ ok: true, cycle: result })
