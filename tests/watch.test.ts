@@ -5,11 +5,14 @@ import {
   removeWatchTarget,
   listUserWatchTargets,
   watchLockKey,
+  watchUnknownStreakKey,
   clearWatchLock,
   clearAllWatchLocksForTarget,
   checkTargetLive,
   triggerWatchTargetIfLive,
   runWatchCycle,
+  WATCH_CHECK_INTERVAL_MINUTES,
+  WATCH_UNKNOWN_STREAK_TO_DISPATCH,
 } from '../src/watch'
 import { getStore } from '../src/store'
 
@@ -209,6 +212,138 @@ describe('Watch & Auto-record', () => {
       expect(secondTrigger.detail).toBe('already_recording')
     } finally {
       globalThis.fetch = originalFetch
+    }
+  })
+
+  it('check interval is a single source of truth matching the 2-minute cron', () => {
+    expect(WATCH_CHECK_INTERVAL_MINUTES).toBe(2)
+    expect(WATCH_UNKNOWN_STREAK_TO_DISPATCH).toBe(3)
+  })
+
+  it('triggerWatchTargetIfLive does not dispatch a runner for an offline target', async () => {
+    const originalFetch = globalThis.fetch
+    let githubCalls = 0
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('chatvideocontext')) {
+        return new Response(JSON.stringify({ room_status: 'offline' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.includes('api.github.com')) {
+        githubCalls += 1
+        return new Response(null, { status: 204 })
+      }
+      return new Response('Not Found', { status: 404 })
+    })
+
+    try {
+      const target: any = { platform: 'chaturbate', identifier: 'offline_model', target: 'offline_model', chatId: 123 }
+      const env: any = { GITHUB_TOKEN: 'fake_token', BOT_TOKEN: 'fake_bot' }
+      const res = await triggerWatchTargetIfLive(env, store, target)
+      expect(res.live).toBe(false)
+      expect(res.triggered).toBe(false)
+      expect(res.detail).toBe('offline')
+      expect(githubCalls).toBe(0)
+      expect(await store.get(watchLockKey('chaturbate', 'offline_model'))).toBeNull()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('triggerWatchTargetIfLive still dispatches a cloud watcher when the check is unknown', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('chatvideocontext') || url.includes('get_edge_hls_url_ajax')) {
+        return new Response('Forbidden', { status: 403 })
+      }
+      if (url.includes('api.github.com')) {
+        return new Response(null, { status: 204 })
+      }
+      return new Response('Not Found', { status: 404 })
+    })
+
+    try {
+      const target: any = { platform: 'chaturbate', identifier: 'blocked_model', target: 'blocked_model', chatId: 123 }
+      const env: any = { GITHUB_TOKEN: 'fake_token', BOT_TOKEN: 'fake_bot' }
+      const res = await triggerWatchTargetIfLive(env, store, target)
+      expect(res.live).toBe(false)
+      expect(res.triggered).toBe(true)
+      expect(await store.get(watchLockKey('chaturbate', 'blocked_model'))).toBeTruthy()
+    } finally {
+      globalThis.fetch = originalFetch
+      await clearWatchLock(store, 'chaturbate', 'blocked_model')
+    }
+  })
+
+  it('runWatchCycle dispatches a cloud watcher only after a persistent unknown streak', async () => {
+    const originalFetch = globalThis.fetch
+    let githubCalls = 0
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('chatvideocontext') || url.includes('get_edge_hls_url_ajax')) {
+        return new Response('Forbidden', { status: 403 })
+      }
+      if (url.includes('api.github.com')) {
+        githubCalls += 1
+        return new Response(null, { status: 204 })
+      }
+      return new Response('Not Found', { status: 404 })
+    })
+
+    try {
+      await addWatchTarget(777, 'streak_model', store)
+      const env: any = { GITHUB_TOKEN: 'fake_token', BOT_TOKEN: 'fake_bot' }
+
+      const cycle1 = await runWatchCycle(env, store)
+      expect(cycle1.checked).toBe(1)
+      expect(cycle1.triggered).toBe(0)
+      expect(cycle1.unknown).toBe(1)
+      expect(githubCalls).toBe(0)
+
+      const cycle2 = await runWatchCycle(env, store)
+      expect(cycle2.triggered).toBe(0)
+      expect(githubCalls).toBe(0)
+
+      // Third consecutive unknown cycle: the streak threshold is reached.
+      const cycle3 = await runWatchCycle(env, store)
+      expect(cycle3.triggered).toBe(1)
+      expect(githubCalls).toBe(1)
+
+      // Fourth cycle: the session lock caps it — no second runner.
+      const cycle4 = await runWatchCycle(env, store)
+      expect(cycle4.triggered).toBe(0)
+      expect(githubCalls).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+      await removeWatchTarget(777, 'streak_model', store)
+      await store.delete(watchUnknownStreakKey('chaturbate', 'streak_model'))
+    }
+  })
+
+  it('runWatchCycle never dispatches for a TikTok name that does not exist (http_404)', async () => {
+    const originalFetch = globalThis.fetch
+    let githubCalls = 0
+    globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('api.github.com')) {
+        githubCalls += 1
+        return new Response(null, { status: 204 })
+      }
+      return new Response('Not Found', { status: 404 })
+    })
+
+    try {
+      await addWatchTarget(778, '@nosuchuser', store)
+      const env: any = { GITHUB_TOKEN: 'fake_token', BOT_TOKEN: 'fake_bot' }
+      for (let i = 0; i < 3; i += 1) {
+        const cycle = await runWatchCycle(env, store)
+        expect(cycle.triggered).toBe(0)
+        expect(cycle.unknown).toBe(1)
+      }
+      expect(githubCalls).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+      await removeWatchTarget(778, '@nosuchuser', store)
+      await store.delete(watchUnknownStreakKey('tiktok', 'nosuchuser'))
     }
   })
 
