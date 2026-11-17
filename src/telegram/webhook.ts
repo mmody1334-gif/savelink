@@ -3,6 +3,8 @@ import { maxUploadBytes, profileMaxItems, rateLimitPerMin } from '../config'
 import { ResolveError, errorMessage } from '../errors'
 import { signFileUrl } from '../files'
 import { resolveInstagramProfile, fetchArchivePage, type InstagramProfileResult } from '../instagram-profile'
+import { instagramApi } from '../instagram-public'
+import { instagramSidecar } from '../instagram-sidecar'
 import {
   fetchActiveStories,
   fetchHighlightItems,
@@ -20,7 +22,7 @@ import {
 } from '../facebook-stories'
 import { handleMovieCallback, handleMovieCommand } from './movie-handlers'
 import { handleBypassCommand } from './bypass-handlers'
-import { isPaused, setPaused, canControlPause, cancelAllGitHubRuns } from '../pause'
+import { isPaused, setPaused, canControlPause, isPauseConfigured, cancelAllGitHubRuns } from '../pause'
 import {
   handleAiCommand,
   handleAudioMessage,
@@ -60,6 +62,7 @@ import {
   type BunkrAlbumDetail,
 } from '../bunkr'
 import {
+  WATCH_CHECK_INTERVAL_MINUTES,
   addWatchTarget,
   removeWatchTarget,
   listUserWatchTargets,
@@ -362,6 +365,16 @@ async function handleInlineQuery(
   }
 }
 
+/**
+ * Any source that can serve Instagram stories/highlights: the hosted API
+ * (IG_API_KEY, tried first by fetchActiveStories/fetchHighlights), the
+ * sidecar, or a session cookie. The old gate demanded IG_COOKIE only, which
+ * blocked the Apify path even when it was configured.
+ */
+export function hasInstagramStoriesSource(env: Env): boolean {
+  return Boolean(env.IG_COOKIE) || Boolean(instagramApi(env)) || Boolean(instagramSidecar(env))
+}
+
 async function handleCommand(
   tg: TelegramApi,
   message: TgMessage,
@@ -489,7 +502,7 @@ async function handleCommand(
         })
         return
       }
-      if (!env.IG_COOKIE) {
+      if (!hasInstagramStoriesSource(env)) {
         await tg.call('sendMessage', {
           chat_id: chatId,
           text: t(lang, 'storiesNeedCookie'),
@@ -561,7 +574,7 @@ async function handleCommand(
         })
         return
       }
-      if (!env.IG_COOKIE) {
+      if (!hasInstagramStoriesSource(env)) {
         await tg.call('sendMessage', {
           chat_id: chatId,
           text: t(lang, 'storiesNeedCookie'),
@@ -707,14 +720,14 @@ async function handleWatchCommand(
   if (!rest) {
     const helpMsg = lang === 'ar'
       ? `👁️ <b>المراقبة والتسجيل التلقائي (Auto-Record)</b>\n\n` +
-        `يراقب البوت حسابك أو أي حساب كل 5 دقائق، وأول ما يفتح لايف يبدأ التسجيل السحابي فوراً بدون تدخل منك!\n\n` +
+        `يراقب البوت حسابك أو أي حساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق، وأول ما يفتح لايف يبدأ التسجيل السحابي فوراً بدون تدخل منك!\n\n` +
         `<b>طريقة الاستخدام:</b>\n` +
         `• تيك توك: <code>/watch @shad.208</code>\n` +
         `• شاتوربيت: <code>/watch visceratio</code>\n\n` +
         `• لإلغاء المراقبة: <code>/unwatch @username</code>\n` +
         `• لعرض قائمة المراقبة: <code>/watchlist</code>`
       : `👁️ <b>Auto-Record Watcher</b>\n\n` +
-        `Watches creators and automatically starts recording as soon as they go live!\n\n` +
+        `Watches creators (checked every ${WATCH_CHECK_INTERVAL_MINUTES} minutes) and automatically starts recording as soon as they go live!\n\n` +
         `<b>Usage:</b>\n` +
         `• TikTok: <code>/watch @username</code>\n` +
         `• Chaturbate: <code>/watch model</code>\n\n` +
@@ -745,9 +758,10 @@ async function handleWatchCommand(
   const plat = target.platform === 'tiktok' ? 'TikTok Live' : (target.platform === 'stripchat' ? 'Stripchat' : 'Chaturbate')
 
   // Immediate live check: if live right now, dispatch recorder right now!
+  let liveTrigger: { live: boolean; triggered: boolean; detail: string } | null = null
   try {
-    const liveTrigger = await triggerWatchTargetIfLive(env, store, target)
-    if (liveTrigger.triggered) {
+    liveTrigger = await triggerWatchTargetIfLive(env, store, target)
+    if (liveTrigger.triggered && liveTrigger.live) {
       const liveMsg = lang === 'ar'
         ? `🟢 <b>الحساب مباشر (LIVE) الآن!</b>\n\n` +
           `👤 <b>الحساب:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
@@ -763,6 +777,26 @@ async function handleWatchCommand(
       await tg.call('sendMessage', {
         chat_id: chatId,
         text: liveMsg,
+        parse_mode: 'HTML',
+        reply_to_message_id: message.message_id,
+      })
+      return
+    }
+
+    if (liveTrigger.triggered && !liveTrigger.live) {
+      const watcherMsg = lang === 'ar'
+        ? `⏳ <b>تعذّرت قراءة حالة الحساب من هنا.</b>\n\n` +
+          `👤 <b>الحساب:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
+          `☁️ <b>تم تشغيل مراقب سحابي</b> يتابع الحساب بدلاً من ذلك، وسيبدأ التسجيل تلقائياً أول ما يفتح لايف.\n` +
+          `📦 سيتم إرسال الفيديو لك فور انتهاء البث.`
+        : `⏳ <b>Could not read this account's status from here.</b>\n\n` +
+          `👤 <b>Target:</b> <code>${escapeHtml(target.target)}</code> (${plat})\n` +
+          `☁️ <b>A cloud watcher is now tracking it</b> instead, and will start recording automatically when it goes live.\n` +
+          `📦 Video will be sent when the broadcast ends.`
+
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: watcherMsg,
         parse_mode: 'HTML',
         reply_to_message_id: message.message_id,
       })
@@ -806,15 +840,22 @@ async function handleWatchCommand(
     console.error('Immediate live check error:', e)
   }
 
-  const successMsg = lang === 'ar'
-    ? `✅ <b>تمت الإضافة لقائمة المراقبة والتسجيل التلقائي!</b>\n\n` +
-      `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-      `⏱️ <b>الفحص:</b> فحص ذكي كل 20 ثانية في السحابة\n` +
-      `🎥 <b>الإجراء:</b> تم تشغيل المسجل السحابي في الخلفية — إذا كانت الموديل أونلاين سيسجل فوراً، وإذا كانت أوفلاين سيراقبها ويبدأ التسجيل تلقائياً أول ما تفتح لايف وجهازك مغلق!`
-    : `✅ <b>Added to Auto-Record Watchlist!</b>\n\n` +
-      `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
-      `⏱️ <b>Interval:</b> Checked every 20 seconds in cloud\n` +
-      `🎥 <b>Action:</b> Will record automatically when live.`
+  const tokenWarning =
+    liveTrigger?.detail === 'no_github_token'
+      ? lang === 'ar'
+        ? `\n\n⚠️ <b>تنبيه:</b> التسجيل السحابي غير مهيأ (GITHUB_TOKEN غير مضبوط)، فالمراقبة وحدها لن تبدأ أي تسجيل.`
+        : `\n\n⚠️ <b>Warning:</b> cloud recording is not configured (GITHUB_TOKEN is missing), so watching alone will not start any recording.`
+      : ''
+  const successMsg =
+    (lang === 'ar'
+      ? `✅ <b>تمت الإضافة لقائمة المراقبة والتسجيل التلقائي!</b>\n\n` +
+        `👤 <b>الحساب:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+        `⏱️ <b>الفحص:</b> كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق\n` +
+        `🎥 <b>الإجراء:</b> البوت يراقب الحساب باستمرار، وأول ما يفتح لايف سيبدأ التسجيل السحابي تلقائياً ويرسل لك الفيديو — حتى وجهازك مغلق!`
+      : `✅ <b>Added to Auto-Record Watchlist!</b>\n\n` +
+        `👤 <b>Target:</b> <code>${escapeHtml(res.target!.target)}</code> (${plat})\n` +
+        `⏱️ <b>Interval:</b> Checked every ${WATCH_CHECK_INTERVAL_MINUTES} minutes\n` +
+        `🎥 <b>Action:</b> The bot keeps watching and will start recording automatically when live.`) + tokenWarning
 
   await tg.call('sendMessage', {
     chat_id: chatId,
@@ -1029,6 +1070,9 @@ async function handleTrimCommand(
         'User-Agent': 'SaveLink-Telegram-Bot',
         'Content-Type': 'application/json',
       },
+      // NOTE: the bot token is NOT sent here. Workflow inputs are visible in
+      // the Actions UI of the public repo; the runner reads BOT_TOKEN from a
+      // GitHub secret instead (see .github/workflows/trim.yml).
       body: JSON.stringify({
         ref: 'main',
         inputs: {
@@ -1036,7 +1080,6 @@ async function handleTrimCommand(
           start,
           end,
           chat_id: String(chatId),
-          bot_token: env.BOT_TOKEN || '',
         },
       }),
     })
@@ -1256,6 +1299,9 @@ async function handleFrameCommand(
         'User-Agent': 'SaveLink-Telegram-Bot',
         'Content-Type': 'application/json',
       },
+      // NOTE: the bot token is NOT sent here. Workflow inputs are visible in
+      // the Actions UI of the public repo; the runner reads BOT_TOKEN from a
+      // GitHub secret instead (see .github/workflows/frame.yml).
       body: JSON.stringify({
         ref: 'main',
         inputs: {
@@ -1263,7 +1309,6 @@ async function handleFrameCommand(
           start,
           end,
           chat_id: String(chatId),
-          bot_token: env.BOT_TOKEN || '',
         },
       }),
     })
@@ -2634,12 +2679,14 @@ async function triggerGitHubRecorder(
       'User-Agent': 'SaveLink-Telegram-Bot',
       'Content-Type': 'application/json',
     },
+    // NOTE: the bot token is NOT sent here. Workflow inputs are visible in
+    // the Actions UI of the public repo; the runner reads BOT_TOKEN from a
+    // GitHub secret instead (see .github/workflows/record.yml).
     body: JSON.stringify({
       ref: 'main',
       inputs: {
         model,
         chat_id: String(chatId),
-        bot_token: env.BOT_TOKEN || '',
       },
     }),
   })
@@ -2702,6 +2749,17 @@ async function getGitHubRecorderStatus(
   const data: any = await listRes.json()
   const runs = data.workflow_runs || []
   return { active: runs.length > 0, count: runs.length }
+}
+
+/**
+ * Shared-secret auth for the sidecar (YTDLP_TOKEN). Without it the sidecar
+ * rejects /record/* calls when its own YTDLP_TOKEN is set — and the bot token
+ * must never travel in these requests: the sidecar reads BOT_TOKEN from its
+ * own environment.
+ */
+function sidecarAuthHeaders(env: Env): Record<string, string> {
+  const token = (env.YTDLP_TOKEN || '').trim()
+  return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
 async function handleRecordCommand(
@@ -2901,7 +2959,7 @@ async function handleRecordCommand(
                 ? `⚠️ <b>الموديل ${escapeHtml(model)} غير متصلة حالياً (Offline).</b>\n\n` +
                   `💡 <b>لتسجيل البث فور بدئه بدون انتظار:</b>\n` +
                   `اكتب: <code>/watch ${escapeHtml(model)}</code>\n` +
-                  `سيقوم البوت بمراقبة الحساب كل 5 دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
+                  `سيقوم البوت بمراقبة الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
                 : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch ${escapeHtml(model)}</code> to record automatically once live.`,
               parse_mode: 'HTML',
             })
@@ -2949,7 +3007,7 @@ async function handleRecordCommand(
               ? `⚠️ <b>الموديل ${escapeHtml(model)} غير متصلة حالياً (Offline).</b>\n\n` +
                 `💡 <b>لتسجيل البث فور بدئه بدون انتظار:</b>\n` +
                 `اكتب: <code>/watch https://stripchat.com/${escapeHtml(model)}</code>\n` +
-                `سيقوم البوت بمراقبة الحساب كل 5 دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
+                `سيقوم البوت بمراقبة الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
               : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch https://stripchat.com/${escapeHtml(model)}</code> to record automatically once live.`,
             parse_mode: 'HTML',
           })
@@ -2967,11 +3025,12 @@ async function handleRecordCommand(
       const base = endpoint.replace(/\/+$/, '')
       const recRes = await fetch(`${base}/record/start`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
+        // The bot token is NOT sent here: the sidecar reads BOT_TOKEN from its
+        // own environment. The shared YTDLP_TOKEN bearer authenticates us.
         body: JSON.stringify({
           url: clean,
           chat_id: chatId,
-          bot_token: env.BOT_TOKEN,
         }),
         signal: AbortSignal.timeout(15_000),
       })
@@ -3064,7 +3123,7 @@ async function handleStopCommand(
       const base = endpoint.replace(/\/+$/, '')
       const stopRes = await fetch(`${base}/record/stop`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
         body: JSON.stringify({ url: model }),
         signal: AbortSignal.timeout(15_000),
       })
@@ -3127,7 +3186,7 @@ async function handleRecordCallback(
         const base = endpoint.replace(/\/+$/, '')
         const stopRes = await fetch(`${base}/record/stop`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
           body: JSON.stringify({ url: model }),
           signal: AbortSignal.timeout(15_000),
         })
@@ -3160,7 +3219,7 @@ async function handleRecordCallback(
       } else if (endpoint) {
         const base = endpoint.replace(/\/+$/, '')
         const statRes = await fetch(`${base}/record/status`, {
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
           signal: AbortSignal.timeout(10_000),
         })
         const data: any = await statRes.json()
@@ -3495,6 +3554,9 @@ function profileText(profile: InstagramProfileResult, lang: Lang, withPhotos: bo
     '',
     info.hd ? t(lang, 'profileHdActive') : t(lang, 'profileHdNote'),
   ]
+  if (withPhotos && profile.truncated && profile.photoCount > 0 && info.posts) {
+    lines.push(t(lang, 'profileTruncated', { shown: profile.photoCount, total: info.posts }))
+  }
   if (withPhotos && !profile.photoCount) lines.push(t(lang, 'profileNoPhotos'))
   return lines.join('\n')
 }
@@ -4805,7 +4867,7 @@ async function handleCallback(
       await answer(tg, query?.id, t(lang, 'expired'), true)
       return
     }
-    if (!env.IG_COOKIE) {
+    if (!hasInstagramStoriesSource(env)) {
       await answer(tg, query?.id, t(lang, 'storiesNeedCookie'), true)
       return
     }
@@ -5327,7 +5389,7 @@ async function handleMenuCallback(
       ? `🎵 <b>ميزات تيك توك وبثوث اللايف (TikTok):</b>\n\n` +
         `• <b>تحميل الفيديوهات والسلايدات:</b> بدون علامة مائية وبأعلى وضوح مع خيار استخراج الصوت MP3.\n` +
         `• <b>تسجيل البث المباشر سحابياً (TikTok Live):</b> أرسل رابط البث (مثل <code>vt.tiktok.com</code>) أو اكتب <code>/record @username</code> ليبدأ التسجيل فوراً على سيرفر سحابي خارجي.\n` +
-        `• <b>المراقبة التلقائية الذكية:</b> <code>/watch @username</code> – يراقب الحساب كل 5 دقائق في الخلفية، وفور فتح اللايف يسجله تلقائياً ويرسله لك!`
+        `• <b>المراقبة التلقائية الذكية:</b> <code>/watch @username</code> – يراقب الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق في الخلفية، وفور فتح اللايف يسجله تلقائياً ويرسله لك!`
       : `🎵 <b>TikTok & Live Features:</b>\n\n` +
         `• <b>Watermark-free Downloads:</b> Videos and image sliders in full original quality.\n` +
         `• <b>Audio Extraction:</b> Download audio track as MP3 with one click.\n` +
@@ -5455,6 +5517,20 @@ async function handlePausedUpdate(tg: TelegramApi, update: any, env: Env): Promi
 
 async function handleStopAll(tg: TelegramApi, message: TgMessage, env: Env): Promise<void> {
   const chatId = message.chat.id
+  if (!isPauseConfigured(env)) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text:
+        '⛔ <b>أمر الإيقاف الكامل معطّل.</b>\n\n' +
+        'لم يتم تظبيط <code>OWNER_ID</code> في إعدادات الووركر، فلا أحد يستطيع إيقاف البوت أو تشغيله — وهذا مقصود للأمان.\n' +
+        'أضف رقم تيليجرام الخاص بك إلى <code>OWNER_ID</code> ثم أعد النشر.\n\n' +
+        '⛔ <b>The global kill-switch is disabled.</b>\n' +
+        'OWNER_ID is not configured in the Worker, so nobody can pause or resume the bot — by design. Add your Telegram user id to OWNER_ID and redeploy.',
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
   if (!canControlPause(env, message.from?.id)) return
   await setPaused(env, true, message.from?.id)
   let cancelled = 0
@@ -5478,6 +5554,20 @@ async function handleStopAll(tg: TelegramApi, message: TgMessage, env: Env): Pro
 }
 
 async function handleResumeAll(tg: TelegramApi, message: TgMessage, env: Env): Promise<void> {
+  if (!isPauseConfigured(env)) {
+    await tg.call('sendMessage', {
+      chat_id: message.chat.id,
+      text:
+        '⛔ <b>أمر التشغيل الكامل معطّل.</b>\n\n' +
+        'لم يتم تظبيط <code>OWNER_ID</code> في إعدادات الووركر، فلا أحد يستطيع إيقاف البوت أو تشغيله — وهذا مقصود للأمان.\n' +
+        'أضف رقم تيليجرام الخاص بك إلى <code>OWNER_ID</code> ثم أعد النشر.\n\n' +
+        '⛔ <b>The global kill-switch is disabled.</b>\n' +
+        'OWNER_ID is not configured in the Worker, so nobody can pause or resume the bot — by design. Add your Telegram user id to OWNER_ID and redeploy.',
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
   if (!canControlPause(env, message.from?.id)) return
   await setPaused(env, false)
   await tg.call('sendMessage', {

@@ -103,6 +103,10 @@ const strings = {
     ar: '📥 لا توجد منشورات ظاهرة لهذا الحساب.\nيمكنك تنزيل صورة الحساب من الزر أعلاه.',
     en: '📥 No posts are visible for this account.\nYou can still download the profile picture above.',
   },
+  profileTruncated: {
+    ar: 'ℹ️ إنستغرام يعرض أحدث {shown} من أصل {total} منشوراً فقط بدون تسجيل دخول.',
+    en: 'ℹ️ Instagram only exposes the latest {shown} of {total} posts without a session.',
+  },
   profileHdNote: {
     ar: 'ℹ️ بدون تسجيل دخول يقدّم إنستغرام الصورة بدقة 150×150 فقط. لدقة كاملة أضف <code>IG_COOKIE</code>.',
     en: 'ℹ️ Without a session, Instagram only serves a 150×150 avatar. Add <code>IG_COOKIE</code> for the full-resolution one.',
