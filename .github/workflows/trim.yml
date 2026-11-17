@@ -15,14 +15,16 @@ on:
       chat_id:
         description: 'Telegram Chat ID'
         required: true
-      bot_token:
-        description: 'Telegram Bot Token'
-        required: true
 
 jobs:
   trim:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      # The bot token is a secret, never a dispatch input: dispatch inputs are
+      # visible in the Actions UI of this public repo. Add BOT_TOKEN under
+      # Settings -> Secrets and variables -> Actions before dispatching.
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -44,4 +46,4 @@ jobs:
 
       - name: Trim Video
         run: |
-          python trim.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+          python trim.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}"
