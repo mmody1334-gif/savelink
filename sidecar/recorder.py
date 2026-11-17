@@ -618,7 +618,11 @@ class RecordingJob:
                             return
                 except Exception:
                     pass
-            time.sleep(2)
+            # Ask the Worker every 40s (each poll costs a KV read on the free plan).
+            for _ in range(40):
+                if self.stop_requested or (self.process is not None and self.process.poll() is not None):
+                    return
+                time.sleep(1)
 
     def stop(self):
         self.stop_requested = True
@@ -1232,13 +1236,16 @@ if __name__ == "__main__":
     import signal
 
     if len(sys.argv) < 3:
-        print("Usage: python recorder.py <target_url_or_user> <chat_id> [bot_token]")
+        print("Usage: python recorder.py <target_url_or_user> <chat_id> [watch_mode]  (BOT_TOKEN from env)")
         sys.exit(1)
 
     cli_target = sys.argv[1]
     cli_chat = sys.argv[2]
-    cli_token = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BOT_TOKEN", "")
-    cli_watch = (sys.argv[4] if len(sys.argv) > 4 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
+    # The bot token never travels on the command line (it would show up in
+    # process lists and CI logs). It comes from the BOT_TOKEN environment
+    # variable, set from a GitHub secret by the workflow.
+    cli_token = os.getenv("BOT_TOKEN", "")
+    cli_watch = (sys.argv[3] if len(sys.argv) > 3 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
 
     platform, identifier, stream_url = parse_stream_target(cli_target)
     if platform == "unknown":

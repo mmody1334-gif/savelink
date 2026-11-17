@@ -110,7 +110,9 @@ def health() -> dict:
 @app.post("/record/start")
 def api_record_start(req: RecordRequest, authorization: str = Header(default="")) -> dict:
     _authorize(authorization)
-    res = start_recording(req.url, req.chat_id, req.bot_token)
+    # The bot token is no longer accepted over the wire: the sidecar reads
+    # BOT_TOKEN from its own environment (Render env var).
+    res = start_recording(req.url, req.chat_id, req.bot_token or os.getenv("BOT_TOKEN", ""))
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("error"))
     return res

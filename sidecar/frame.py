@@ -420,14 +420,16 @@ def extract_frames(
 
 def main() -> None:
     if len(sys.argv) < 4:
-        print("Usage: python frame.py <url> <start> <end> [chat_id] [bot_token]")
+        print("Usage: python frame.py <url> <start> <end> [chat_id]  (BOT_TOKEN from env)")
         sys.exit(1)
 
     url = sys.argv[1]
     start = sys.argv[2]
     end = sys.argv[3]
     chat_id = sys.argv[4] if len(sys.argv) > 4 else ""
-    bot_token = sys.argv[5] if len(sys.argv) > 5 else ""
+    # The bot token comes from the BOT_TOKEN environment variable (GitHub
+    # secret), never from argv: argv shows up in process lists and CI logs.
+    bot_token = os.getenv("BOT_TOKEN", "")
 
     success = extract_frames(url, start, end, chat_id, bot_token)
     sys.exit(0 if success else 1)

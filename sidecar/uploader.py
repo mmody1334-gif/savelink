@@ -151,7 +151,9 @@ def main():
 
     target = sys.argv[1]
     chat_id = sys.argv[2]
-    bot_token = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BOT_TOKEN", "")
+    # The bot token comes from the BOT_TOKEN environment variable (GitHub
+    # secret), never from argv: argv shows up in process lists and CI logs.
+    bot_token = os.getenv("BOT_TOKEN", "")
 
     if not RECORDINGS_DIR.exists():
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
