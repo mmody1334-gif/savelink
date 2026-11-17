@@ -104,17 +104,41 @@ function fromTikTokHtml(html: string, sourceUrl: string): MediaResult | null {
   }
 }
 
+/**
+ * tikwm with one retry for transient failures (429/5xx). A 403 from tikwm is
+ * a hard IP block (its own Cloudflare front door rejects datacenter IPs, and
+ * the Worker is one), so retrying it only burns time — the durable fix for
+ * that case is the yt-dlp sidecar, which runs first in ENGINE_ORDER when it
+ * is configured. Timeouts are not retried either: one attempt already costs
+ * up to 15s.
+ */
+async function fetchTikwm(url: string): Promise<any> {
+  let lastError: Error | null = null
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await fetchJson<any>(
+        `${TIKWM}?url=${encodeURIComponent(url)}&hd=1`,
+        { headers: { Accept: 'application/json', 'User-Agent': MOBILE_UA } },
+        15_000,
+      )
+    } catch (error) {
+      lastError = error as Error
+      const status = Number(String(lastError.message).match(/HTTP (\d{3})/)?.[1])
+      const retryable = status === 429 || status >= 500
+      if (!retryable || attempt === 1) throw lastError
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+  }
+  throw lastError ?? new Error('tikwm request failed')
+}
+
 export async function extractTikTok(input: ResolveInput): Promise<MediaResult> {
   const url = await canonicalTikTokUrl(input.url)
   const failures: string[] = []
 
   // 1) tikwm.com - free public API that returns watermark-free MP4 + the original MP3.
   try {
-    const payload = await fetchJson<any>(
-      `${TIKWM}?url=${encodeURIComponent(url)}&hd=1`,
-      { headers: { Accept: 'application/json', 'User-Agent': MOBILE_UA } },
-      15_000,
-    )
+    const payload = await fetchTikwm(url)
     if (payload?.code === 0 && payload?.data) {
       const result = fromTikwm(payload.data)
       result.sourceUrl = url
