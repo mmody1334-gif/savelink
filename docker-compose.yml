@@ -7,6 +7,9 @@ services:
     environment:
       # Shared secret with the Worker (wrangler secret YTDLP_TOKEN).
       YTDLP_TOKEN: ${YTDLP_TOKEN:-}
+      # Bot token for /record/start notifications. The Worker no longer sends
+      # it; the sidecar reads it from its own environment.
+      BOT_TOKEN: ${BOT_TOKEN:-}
       # Public URL of this service, so the Worker can fetch finished files.
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
       MEDIA_DIR: /data

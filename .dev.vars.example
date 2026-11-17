@@ -28,3 +28,6 @@ PUBLIC_BASE_URL=http://localhost:8787
 # MAX_UPLOAD_MB=45
 # RATE_LIMIT_PER_MIN=12
 # PROFILE_MAX_ITEMS=30
+# OWNER_ID=123456789
+# ^ Your Telegram user id (from /id). ONLY these users may run /stopall and
+# /resumeall. If OWNER_ID is unset, NOBODY can pause or resume the bot.

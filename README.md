@@ -161,6 +161,10 @@ Summary:
 | `COBALT_INSTANCES` | optional | Comma-separated self-hosted cobalt URLs (do not use `api.cobalt.tools`) |
 | `COBALT_API_KEY` | optional | `Api-Key` for those instances |
 | `IG_COOKIE` / `FB_COOKIE` / `PINTEREST_COOKIE` | optional | Session cookies for private/blocked posts, the Instagram HD avatar, the full archive, stories and highlights |
+| `OWNER_ID` | required for kill-switch | Telegram user id of the owner. `/stopall` and `/resumeall` only work for this id; when unset nobody can use them (fail closed) |
+| `GITHUB_TOKEN` | optional | Dispatches GitHub Actions cloud watchers/recorders; without it `/watch` only reports and never records |
+
+> **Security:** the bot token never travels as a workflow input. The GitHub Actions workflows (`record.yml`, `trim.yml`, `frame.yml`) read `BOT_TOKEN` from the repository secret — set it in both `mmody1334-gif/savelink` and `mmody1334-gif/cb-recorder` (the dispatch target). The `/api/watch/status`, `/api/watch/check` and `/api/watch/cycle` endpoints require the `WEBHOOK_SECRET` (`X-Telegram-Bot-Api-Secret-Token` header or `Authorization: Bearer <secret>`). The sidecar `/record/*` endpoints require the `YTDLP_TOKEN` bearer from the Worker.
 | `PROFILE_MAX_ITEMS` | no | Default `30`; max photos per Instagram profile request (clamped to 30) |
 | `ENGINE_ORDER` | no | Default `ytdlp,native,cobalt` |
 | `MAX_UPLOAD_MB` | no | Default `45` (Telegram Bot API limit) |

@@ -28,6 +28,9 @@ GITHUB_RECORDER_REPO = "mmody1334-gif/cb-recorder"
 enabled = true
 
 [triggers]
+# Watch cadence: the single source of truth is WATCH_CHECK_INTERVAL_MINUTES
+# in src/watch.ts (2). If this cron changes, update the constant and the
+# user-facing messages that use it.
 crons = ["*/2 * * * *"]
 
 # Persistent state: button payloads, result cache and rate limits survive

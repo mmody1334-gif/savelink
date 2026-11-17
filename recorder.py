@@ -1126,11 +1126,11 @@ class RecordingJob:
         # Optimize container for instant in-browser streaming (FastStart)
         self.output_path = ensure_faststart_streaming(self.output_path)
 
-        # 1. Try Gofile (fast, reliable, no size limit)
-        download_url = upload_to_gofile(self.output_path)
-        # 2. Try Pixeldrain as fallback
+        # 1. Try Pixeldrain (supports direct in-browser streaming, fast, up to 10GB)
+        download_url = upload_to_pixeldrain(self.output_path)
+        # 2. Try Gofile as fallback
         if not download_url:
-            download_url = upload_to_pixeldrain(self.output_path)
+            download_url = upload_to_gofile(self.output_path)
 
         self.final_url = download_url
         logger.info(f"Uploaded URL for {self.identifier}: {download_url}")
@@ -1236,13 +1236,16 @@ if __name__ == "__main__":
     import signal
 
     if len(sys.argv) < 3:
-        print("Usage: python recorder.py <target_url_or_user> <chat_id> [bot_token]")
+        print("Usage: python recorder.py <target_url_or_user> <chat_id> [watch_mode]  (BOT_TOKEN from env)")
         sys.exit(1)
 
     cli_target = sys.argv[1]
     cli_chat = sys.argv[2]
-    cli_token = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BOT_TOKEN", "")
-    cli_watch = (sys.argv[4] if len(sys.argv) > 4 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
+    # The bot token never travels on the command line (it would show up in
+    # process lists and CI logs). It comes from the BOT_TOKEN environment
+    # variable, set from a GitHub secret by the workflow.
+    cli_token = os.getenv("BOT_TOKEN", "")
+    cli_watch = (sys.argv[3] if len(sys.argv) > 3 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
 
     platform, identifier, stream_url = parse_stream_target(cli_target)
     if platform == "unknown":

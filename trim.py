@@ -199,13 +199,15 @@ def trim_video(url: str, start: str, end: str, chat_id: int | str, bot_token: st
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python trim.py <url> <start> <end> <chat_id> [bot_token]")
+        print("Usage: python trim.py <url> <start> <end> <chat_id>  (BOT_TOKEN from env)")
         sys.exit(1)
 
     cli_url = sys.argv[1]
     cli_start = sys.argv[2]
     cli_end = sys.argv[3]
     cli_chat = sys.argv[4]
-    cli_token = sys.argv[5] if len(sys.argv) > 5 else os.getenv("BOT_TOKEN", "")
+    # The bot token comes from the BOT_TOKEN environment variable (GitHub
+    # secret), never from argv: argv shows up in process lists and CI logs.
+    cli_token = os.getenv("BOT_TOKEN", "")
 
     trim_video(cli_url, cli_start, cli_end, cli_chat, cli_token)
