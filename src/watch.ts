@@ -24,6 +24,23 @@ const CHECK_TIMEOUT_MS = 8_000
 const MAX_PARALLEL = 6
 const SESSION_LOCK_SECONDS = 7200
 
+/**
+ * How often watch targets are checked. Single source of truth: this MUST
+ * match the cron trigger in wrangler.toml (every 2 minutes). The user-facing
+ * messages in webhook.ts use this value — never hard-code another interval.
+ */
+export const WATCH_CHECK_INTERVAL_MINUTES = 2
+
+/** Consecutive "unknown" cycles before a cloud watcher is dispatched. */
+export const WATCH_UNKNOWN_STREAK_TO_DISPATCH = 3
+
+/** How long an unknown streak is remembered. */
+const UNKNOWN_STREAK_TTL_SECONDS = 60 * 60 * 24
+
+export function watchUnknownStreakKey(platform: string, identifier: string): string {
+  return `watch:unknown:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
+}
+
 export function watchLockKey(platform: string, identifier: string): string {
   return `watch:lock:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
 }
@@ -345,12 +362,14 @@ async function dispatchRecorder(env: Env, t: WatchTarget, watchMode = '1'): Prom
       'User-Agent': 'SaveLink-Telegram-Bot',
       'Content-Type': 'application/json',
     },
+    // NOTE: the bot token is NOT sent here. Workflow inputs are visible in
+    // the Actions UI of the public repo; the runner reads BOT_TOKEN from a
+    // GitHub secret instead (see .github/workflows/record.yml).
     body: JSON.stringify({
       ref: 'main',
       inputs: {
         model: recorderTargetParam(t),
         chat_id: String(t.chatId),
-        bot_token: env.BOT_TOKEN || '',
         watch_mode: watchMode,
       },
     }),
@@ -381,7 +400,17 @@ export async function triggerWatchTargetIfLive(
     return { live: true, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
   }
 
-  // Cloud Watcher dispatch for platforms where direct edge probes might be blocked
+  if (check.state === 'offline') {
+    // Offline is normal: the cron re-checks every WATCH_CHECK_INTERVAL_MINUTES
+    // and dispatches when the target goes live. Spawning a 6-hour
+    // cloud-watcher runner for every offline target would burn GitHub
+    // Actions minutes for nothing.
+    return { live: false, triggered: false, detail: check.detail || 'offline' }
+  }
+
+  // Unknown: the Worker cannot read this platform at all (e.g. Chaturbate
+  // answers 403 to Cloudflare IPs), so the cloud watcher is the only way
+  // to know when it goes live.
   const dispatch = await dispatchRecorder(env, t, '1')
   if (dispatch.ok) {
     await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
@@ -441,18 +470,33 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
       )
 
       if (check.state === 'unknown') {
-        if (check.detail === 'no_such_room') {
+        unknown++
+        // A name that does not exist must never spawn a runner. TikTok reports
+        // it as http_404, Chaturbate/Stripchat as no_such_room.
+        if (check.detail === 'no_such_room' || check.detail === 'http_404') {
           const lockKey = watchLockKey(t.platform, t.identifier)
           if (await store.get(lockKey)) {
             await store.delete(lockKey)
             console.log(`[watch] ${t.platform}/${t.identifier} room not found - cleared lock`)
           }
-          unknown++
+          await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
           continue
         }
 
-        // If Chaturbate or Stripchat hits edge WAF (403/418), dispatch the Cloud Watcher
-        // on GitHub Actions where curl_cffi runs with full browser TLS impersonation.
+        // "Unknown" also covers one-off network blips. Only a persistent
+        // unknown earns a cloud-watcher runner: the streak must reach
+        // WATCH_UNKNOWN_STREAK_TO_DISPATCH consecutive cycles, and the 2h
+        // session lock still caps it at one runner per target per 2h. The
+        // runner itself runs curl_cffi with full browser TLS impersonation,
+        // which is what gets past the Chaturbate/Stripchat edge WAF (403)
+        // that blocks the Worker.
+        const streak = await store.incr(
+          watchUnknownStreakKey(t.platform, t.identifier),
+          UNKNOWN_STREAK_TTL_SECONDS,
+        )
+        if (streak < WATCH_UNKNOWN_STREAK_TO_DISPATCH) continue
+
+        await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
         const lockKey = watchLockKey(t.platform, t.identifier)
         if (await store.get(lockKey)) {
           continue
@@ -462,7 +506,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
           if (dispatch.ok) {
             await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
             triggered++
-            console.log(`[watch] dispatched cloud watcher for ${t.platform}/${t.identifier}`)
+            console.log(`[watch] dispatched cloud watcher for ${t.platform}/${t.identifier} (unknown x${streak})`)
           }
         } catch (e) {
           console.error(`[watch] cloud watcher dispatch error:`, e)
@@ -470,6 +514,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
         continue
       }
       if (check.state === 'offline') {
+        await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
         const lockKey = watchLockKey(t.platform, t.identifier)
         if (await store.get(lockKey)) {
           await store.delete(lockKey)
@@ -478,6 +523,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
         continue
       }
 
+      await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
       const lockKey = watchLockKey(t.platform, t.identifier)
       if (await store.get(lockKey)) continue
 

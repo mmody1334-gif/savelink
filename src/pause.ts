@@ -25,10 +25,19 @@ export async function setPaused(env: Env, paused: boolean, by?: number | string)
   memo = { value: paused, at: Date.now() }
 }
 
-/** OWNER_ID (comma-separated Telegram user ids) limits who may pause/resume. Unset = anyone. */
+/** True when OWNER_ID lists at least one Telegram user id. */
+export function isPauseConfigured(env: Env): boolean {
+  return Boolean((env.OWNER_ID || '').trim())
+}
+
+/**
+ * OWNER_ID (comma-separated Telegram user ids) limits who may pause/resume.
+ * Unset = NOBODY: a missing OWNER_ID must never leave the kill-switch open
+ * to every Telegram user. Set it with `wrangler secret put OWNER_ID`.
+ */
 export function canControlPause(env: Env, userId?: number): boolean {
   const raw = (env.OWNER_ID || '').trim()
-  if (!raw) return true
+  if (!raw) return false
   if (userId == null) return false
   return raw.split(',').map((s) => s.trim()).includes(String(userId))
 }

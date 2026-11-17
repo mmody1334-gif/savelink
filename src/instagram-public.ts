@@ -186,6 +186,84 @@ export async function apiHighlights(username: string, env: Env): Promise<PublicH
     }))
 }
 
+export interface ApiProfileInfo {
+  username: string
+  fullName?: string
+  followers?: number
+  following?: number
+  posts?: number
+  avatarUrl: string
+  /** true only when the provider returned a high-resolution avatar */
+  hd: boolean
+}
+
+function asCount(value: unknown): number | undefined {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+/**
+ * Profile metadata (avatar + counts) from the hosted Instagram API.
+ *
+ * HikerAPI: GET /v2/user/by/username. Apify: the instagram-scraper actor with
+ * resultsType 'details' — one billed result per profile, and it returns
+ * profilePicUrlHD (320x320), which is better than the embed's 150x150 avatar.
+ * This is the base-info fallback when the embed page is login-walled from
+ * Cloudflare IPs and no IG_COOKIE session is configured.
+ */
+export async function apiProfileInfo(username: string, env: Env): Promise<ApiProfileInfo> {
+  const target = instagramApi(env)
+  if (!target) throw new EngineError('The Instagram API provider is not configured.', 'instagram-api', false)
+
+  if (target.provider === 'apify') {
+    const actor = (env.IG_APIFY_POSTS_ACTOR || 'apify~instagram-scraper').trim()
+    const rows = await request<any[]>(
+      `${target.base}/v2/acts/${actor}/run-sync-get-dataset-items?token=${encodeURIComponent(target.key)}`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          directUrls: [`https://www.instagram.com/${username.replace(/^@/, '')}/`],
+          resultsType: 'details',
+          resultsLimit: 1,
+        }),
+      },
+      'instagram-apify',
+      120_000,
+    )
+    const row: any = Array.isArray(rows) ? rows[0] : undefined
+    const avatar = row?.profilePicUrlHD || row?.profilePicUrl
+    if (!row || !avatar) {
+      throw new EngineError('Instagram API: no profile details returned for this account.', 'instagram-apify')
+    }
+    return {
+      username: String(row.username || username),
+      fullName: typeof row.fullName === 'string' ? row.fullName : undefined,
+      followers: asCount(row.followersCount),
+      following: asCount(row.followsCount),
+      posts: asCount(row.postsCount),
+      avatarUrl: String(avatar),
+      hd: Boolean(row.profilePicUrlHD),
+    }
+  }
+
+  const payload = await hiker<any>(`/v2/user/by/username?username=${encodeURIComponent(username)}`, env)
+  const user: any = payload?.response?.user ?? payload?.user ?? payload?.response ?? payload
+  const avatar = user?.profile_pic_url_hd || user?.profile_pic_url
+  if (!user || typeof user !== 'object' || !avatar) {
+    throw new EngineError('Instagram API: no profile details returned for this account.', 'instagram-api')
+  }
+  return {
+    username: String(user.username || username),
+    fullName: typeof user.full_name === 'string' ? user.full_name : undefined,
+    followers: asCount(user.follower_count),
+    following: asCount(user.following_count),
+    posts: asCount(user.media_count),
+    avatarUrl: String(avatar),
+    hd: Boolean(user.profile_pic_url_hd),
+  }
+}
+
 /**
  * Recent feed photos for a public profile (carousels expanded, videos skipped).
  * Uses Apify's official Instagram scraper: it is billed per returned post, so

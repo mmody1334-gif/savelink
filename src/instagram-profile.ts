@@ -1,7 +1,7 @@
-import { EngineError } from './errors'
+import { EngineError, errorMessage } from './errors'
 import { DESKTOP_UA, IG_APP_UA, MOBILE_UA, decodeEscapes, fetchJson, fetchText } from './http'
 import { queryInstagramGraphQL } from './instagram-graphql'
-import { apiProfilePhotos, instagramApi } from './instagram-public'
+import { apiProfileInfo, apiProfilePhotos, instagramApi } from './instagram-public'
 import { isInstagramUsername } from './platforms'
 import type { Env, MediaItem } from './types'
 
@@ -146,14 +146,30 @@ export async function fetchProfileEmbed(username: string): Promise<InstagramProf
   const avatarUrl = decoded.match(/"profile_pic_url":"([^"]+)"/)?.[1]
 
   if (!foundUsername || !avatarUrl) {
+    // Worded without "private"/"unavailable": the webhook shows the detailed
+    // resolve error for this case, and a login wall is what Instagram serves
+    // both for missing accounts and for blocked datacenter IPs.
     throw new EngineError(
-      'This Instagram profile is private, deleted, or temporarily unavailable.',
+      'Instagram served a login page instead of this profile. The account may not exist, or the embed page is blocked from this server.',
       'instagram-profile',
       false,
     )
   }
 
   const posts = parseEmbedPosts(decoded)
+
+  // Lenient fallback: some embed variants render posts without shortcode keys.
+  // The display URLs alone are still usable photos, kept in the same order.
+  if (!posts.length) {
+    const seenUrls = new Set<string>()
+    for (const match of decoded.matchAll(/"display_url":"(https:[^"]+)"/g)) {
+      const url = match[1]
+      if (seenUrls.has(url)) continue
+      seenUrls.add(url)
+      posts.push({ shortcode: '', displayUrl: url, isVideo: false })
+      if (posts.length >= 30) break
+    }
+  }
 
   return {
     username: foundUsername,
@@ -196,18 +212,30 @@ function parseEmbedPosts(decoded: string): EmbedPost[] {
 }
 
 /**
- * With a logged-in session cookie Instagram answers the web/GraphQL API, which
- * provides real post count, followers count, following count, and full HD avatar.
+ * Base profile info from a logged-in session (GraphQL, then web_profile_info).
+ * Used both to upgrade embed info and as the fallback when the embed page
+ * itself is login-walled — the usual failure from Cloudflare IPs.
  */
-export async function upgradeProfileWithCookie(
-  info: InstagramProfileInfo,
+export async function fetchProfileWithCookie(
+  username: string,
   env: Env,
 ): Promise<InstagramProfileInfo> {
-  if (!env.IG_COOKIE) return info
+  if (!env.IG_COOKIE) {
+    throw new EngineError('An Instagram session (IG_COOKIE) is required.', 'instagram-profile', false)
+  }
+
+  const base: InstagramProfileInfo = {
+    username,
+    avatarUrl: '',
+    hd: false,
+    recentShortcodes: [],
+    recentDisplayUrls: [],
+    videoFlags: [],
+  }
 
   // 1. Modern Web GraphQL: PolarisProfilePageContentQuery
   try {
-    const userId = await resolveUserId(info.username, env)
+    const userId = await resolveUserId(username, env)
     const payload = await queryInstagramGraphQL<any>({
       friendlyName: 'PolarisProfilePageContentQuery',
       docId: '40158838120366999',
@@ -223,19 +251,19 @@ export async function upgradeProfileWithCookie(
         __relay_internal__pv__PolarisShortDramaEnabledrelayprovider: true,
       },
       env,
-      referer: `https://www.instagram.com/${encodeURIComponent(info.username)}/`,
+      referer: `https://www.instagram.com/${encodeURIComponent(username)}/`,
     })
 
     const user = payload?.data?.user
     if (user) {
-      const avatarUrl = user.hd_profile_pic_url_info?.url || user.profile_pic_url || info.avatarUrl
+      const avatarUrl = user.hd_profile_pic_url_info?.url || user.profile_pic_url || ''
       return {
-        ...info,
-        username: user.username || info.username,
-        fullName: user.full_name || info.fullName,
-        followers: typeof user.follower_count === 'number' ? user.follower_count : info.followers,
-        following: typeof user.following_count === 'number' ? user.following_count : info.following,
-        posts: typeof user.media_count === 'number' ? user.media_count : info.posts,
+        ...base,
+        username: user.username || username,
+        fullName: user.full_name || undefined,
+        followers: typeof user.follower_count === 'number' ? user.follower_count : undefined,
+        following: typeof user.following_count === 'number' ? user.following_count : undefined,
+        posts: typeof user.media_count === 'number' ? user.media_count : undefined,
         avatarUrl,
         hd: Boolean(user.hd_profile_pic_url_info?.url),
       }
@@ -248,14 +276,14 @@ export async function upgradeProfileWithCookie(
   let payload: any = null
   try {
     payload = await fetchJson<any>(
-      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(info.username)}`,
+      `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`,
       { headers: igWebHeaders(env) },
       12_000,
     )
   } catch {
     try {
       payload = await fetchJson<any>(
-        `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(info.username)}`,
+        `https://i.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`,
         { headers: igHeaders(env) },
         12_000,
       )
@@ -265,7 +293,13 @@ export async function upgradeProfileWithCookie(
   }
 
   const user = payload?.data?.user
-  if (!user) return info
+  if (!user) {
+    throw new EngineError(
+      `Instagram session could not load @${username}. The IG_COOKIE may have expired.`,
+      'instagram-profile',
+      false,
+    )
+  }
 
   const edges = user.edge_owner_to_timeline_media?.edges
   const nodes = Array.isArray(edges) ? edges.map((edge: any) => edge?.node).filter(Boolean) : []
@@ -276,17 +310,43 @@ export async function upgradeProfileWithCookie(
     shortcodes.length > 0 && displayUrls.length === shortcodes.length && videoFlags.length === shortcodes.length
 
   return {
-    ...info,
-    username: user.username ?? info.username,
-    fullName: user.full_name ?? info.fullName,
-    followers: user.edge_followed_by?.count ?? info.followers,
-    following: user.edge_follow?.count ?? info.following,
-    posts: user.edge_owner_to_timeline_media?.count ?? info.posts,
-    avatarUrl: user.profile_pic_url_hd ?? user.profile_pic_url ?? info.avatarUrl,
+    ...base,
+    username: user.username ?? username,
+    fullName: user.full_name ?? undefined,
+    followers: user.edge_followed_by?.count ?? undefined,
+    following: user.edge_follow?.count ?? undefined,
+    posts: user.edge_owner_to_timeline_media?.count ?? undefined,
+    avatarUrl: user.profile_pic_url_hd ?? user.profile_pic_url ?? '',
     hd: Boolean(user.profile_pic_url_hd),
-    recentShortcodes: aligned ? shortcodes : info.recentShortcodes,
-    recentDisplayUrls: aligned ? displayUrls : info.recentDisplayUrls,
-    videoFlags: aligned ? videoFlags : info.videoFlags,
+    recentShortcodes: aligned ? shortcodes : [],
+    recentDisplayUrls: aligned ? displayUrls : [],
+    videoFlags: aligned ? videoFlags : [],
+  }
+}
+
+/**
+ * With a logged-in session cookie Instagram answers the web/GraphQL API, which
+ * provides real post count, followers count, following count, and full HD avatar.
+ */
+export async function upgradeProfileWithCookie(
+  info: InstagramProfileInfo,
+  env: Env,
+): Promise<InstagramProfileInfo> {
+  if (!env.IG_COOKIE) return info
+
+  try {
+    const fresh = await fetchProfileWithCookie(info.username, env)
+    return {
+      ...info,
+      ...fresh,
+      // The GraphQL step carries no timeline: keep the embed's posts when the
+      // session source has none, so the three arrays never go out of sync.
+      recentShortcodes: fresh.recentShortcodes.length ? fresh.recentShortcodes : info.recentShortcodes,
+      recentDisplayUrls: fresh.recentDisplayUrls.length ? fresh.recentDisplayUrls : info.recentDisplayUrls,
+      videoFlags: fresh.videoFlags.length ? fresh.videoFlags : info.videoFlags,
+    }
+  } catch {
+    return info
   }
 }
 
@@ -621,22 +681,60 @@ export async function resolveInstagramProfile(options: ProfileOptions): Promise<
     throw new EngineError('That is not a valid Instagram username.', 'instagram-profile', false)
   }
 
-  // 1. Base info upgraded with GraphQL / cookie
-  const embed = await fetchProfileEmbed(username).catch(() => null)
-  const baseInfo: InstagramProfileInfo = {
-    username,
-    fullName: embed?.fullName,
-    followers: embed?.followers,
-    following: embed?.following,
-    posts: embed?.posts,
-    avatarUrl: embed?.avatarUrl || '',
-    hd: false,
-    recentShortcodes: embed?.recentShortcodes ?? [],
-    recentDisplayUrls: embed?.recentDisplayUrls ?? [],
-    videoFlags: embed?.videoFlags ?? [],
+  // 1. Base info: embed first, then session, then hosted API. The embed page
+  // is login-walled from Cloudflare IPs, so it must never be the only source:
+  // the old code swallowed its failure and returned an avatar with an empty
+  // URL, which then failed silently at the download button.
+  const failures: string[] = []
+  let info: InstagramProfileInfo | null = null
+
+  try {
+    const embed = await fetchProfileEmbed(username)
+    info = await upgradeProfileWithCookie(embed, options.env)
+  } catch (error) {
+    failures.push(`embed page: ${errorMessage(error)}`)
   }
 
-  const info = await upgradeProfileWithCookie(baseInfo, options.env)
+  if (!info?.avatarUrl && options.env.IG_COOKIE) {
+    try {
+      info = await fetchProfileWithCookie(username, options.env)
+    } catch (error) {
+      failures.push(`session: ${errorMessage(error)}`)
+    }
+  }
+
+  if (!info?.avatarUrl && instagramApi(options.env)) {
+    try {
+      const api = await apiProfileInfo(username, options.env)
+      info = {
+        username: api.username,
+        fullName: api.fullName,
+        followers: api.followers,
+        following: api.following,
+        posts: api.posts,
+        avatarUrl: api.avatarUrl,
+        hd: api.hd,
+        recentShortcodes: [],
+        recentDisplayUrls: [],
+        videoFlags: [],
+      }
+    } catch (error) {
+      failures.push(`hosted API: ${errorMessage(error)}`)
+    }
+  }
+
+  if (!info || !info.avatarUrl) {
+    // Deliberately worded so the webhook shows this detail instead of the
+    // generic "profile not found" message: the account may exist and be
+    // public, Instagram is just refusing every source the bot can reach.
+    throw new EngineError(
+      `Instagram profile could not be loaded (${failures.join('; ') || 'no profile source answered'}). ` +
+        'The embed page is login-walled from Cloudflare IPs — add IG_COOKIE for a session or IG_API_KEY for the hosted API.',
+      'instagram-profile',
+      false,
+    )
+  }
+
   const avatar = avatarItem(info.avatarUrl, info.hd)
   const items: MediaItem[] = [avatar]
   const photos: MediaItem[] = []
