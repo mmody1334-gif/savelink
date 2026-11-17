@@ -742,27 +742,7 @@ export async function resolveInstagramProfile(options: ProfileOptions): Promise<
   // 2. Fetch full media archive if requested
   let videoCount = 0
   if (options.withPhotos) {
-    // Opt-in: the embed only renders a handful of posts, the hosted API returns
-    // as many as PROFILE_MAX_ITEMS asks for (billed per returned post).
-    if ((options.env.PROFILE_SOURCE || '').toLowerCase() === 'api' && instagramApi(options.env)) {
-      try {
-        const limit = Math.max(1, options.maxItems ?? 60)
-        const mediaList = await apiProfilePhotos(username, options.env, limit)
-        if (mediaList.length) {
-          return {
-            info,
-            items: [avatar, ...mediaList],
-            photos: mediaList,
-            photoCount: mediaList.length,
-            videoCount: 0,
-            truncated: Boolean(info.posts && info.posts > mediaList.length),
-          }
-        }
-      } catch {
-        /* fall back to the embed photos */
-      }
-    }
-
+    // Prefer free/fast IG_COOKIE archive before paid Apify API calls.
     if (options.env.IG_COOKIE) {
       try {
         const page = await fetchArchivePage({
@@ -778,6 +758,25 @@ export async function resolveInstagramProfile(options: ProfileOptions): Promise<
             photos: mediaList,
             photoCount: mediaList.length,
             videoCount: page.videoCount,
+            truncated: Boolean(info.posts && info.posts > mediaList.length),
+          }
+        }
+      } catch {
+        // Fall through to hosted API or embed photos
+      }
+    }
+
+    if ((options.env.PROFILE_SOURCE || '').toLowerCase() === 'api' && instagramApi(options.env)) {
+      try {
+        const limit = Math.max(1, options.maxItems ?? 60)
+        const mediaList = await apiProfilePhotos(username, options.env, limit)
+        if (mediaList.length) {
+          return {
+            info,
+            items: [avatar, ...mediaList],
+            photos: mediaList,
+            photoCount: mediaList.length,
+            videoCount: 0,
             truncated: Boolean(info.posts && info.posts > mediaList.length),
           }
         }

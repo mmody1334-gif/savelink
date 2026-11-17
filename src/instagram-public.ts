@@ -38,7 +38,7 @@ export function instagramApi(env: Env): Target | null {
   }
 }
 
-async function request<T>(url: string, init: RequestInit, label: string, timeoutMs = 60000): Promise<T> {
+async function request<T>(url: string, init: RequestInit, label: string, timeoutMs = 25000): Promise<T> {
   let response: Response
   try {
     response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) })
@@ -80,7 +80,7 @@ async function apifyRun(env: Env, input: Record<string, unknown>): Promise<any[]
       body: JSON.stringify(input),
     },
     'instagram-apify',
-    120_000,
+    25_000,
   )
   return Array.isArray(items) ? items : []
 }
@@ -229,7 +229,7 @@ export async function apiProfileInfo(username: string, env: Env): Promise<ApiPro
         }),
       },
       'instagram-apify',
-      120_000,
+      25_000,
     )
     const row: any = Array.isArray(rows) ? rows[0] : undefined
     const avatar = row?.profilePicUrlHD || row?.profilePicUrl
@@ -286,7 +286,7 @@ export async function apiProfilePhotos(username: string, env: Env, limit: number
       }),
     },
     'instagram-apify',
-    120_000,
+    25_000,
   )
 
   const photos: MediaItem[] = []

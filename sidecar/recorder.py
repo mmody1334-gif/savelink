@@ -7,11 +7,13 @@ and sends the download link directly to the user's Telegram chat.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -19,6 +21,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import urllib.error
 import urllib.request
 import urllib.parse
 
@@ -543,32 +546,90 @@ def create_preview_clip(input_path: Path, output_preview_path: Path, duration_se
         return False
 
 
+def _recorder_headers(bot_token: str = "") -> Dict[str, str]:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"}
+    token = (bot_token or os.getenv("BOT_TOKEN", "")).strip()
+    if token:
+        digest = hashlib.sha256(f"savelink-recorder-v1:{token}".encode("utf-8")).hexdigest()
+        headers["X-Recorder-Token"] = digest
+    return headers
+
+
+def save_to_worker_archive(
+    bot_token: str,
+    chat_id: int | str,
+    platform: str,
+    model: str,
+    download_url: str,
+    size_str: str = "",
+    duration_str: str = "",
+    source: str = "recorder",
+) -> bool:
+    """Persists uploaded recording URL to Worker KV archive so /archive always has it."""
+    if not download_url or not chat_id or str(chat_id) == "0":
+        return False
+    worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
+    chat_val: int | str = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+    payload = {
+        "chatId": chat_val,
+        "platform": platform or "universal",
+        "model": model,
+        "url": download_url,
+        "size": size_str,
+        "duration": duration_str,
+        "source": source,
+    }
+    headers = {**_recorder_headers(bot_token), "Content-Type": "application/json"}
+    body = json.dumps(payload).encode("utf-8")
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(f"{worker_base}/api/archive/add", headers=headers, data=body, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            logger.info(f"Saved URL to Worker archive for {model}")
+            return True
+        except Exception as e:
+            logger.warning(f"Archive save attempt {attempt + 1} failed for {model}: {e}")
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+    return False
+
+
 def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url: Optional[str] = None) -> None:
-    """Send completion notification to user with direct download button."""
+    """Send completion notification to user with direct download button (retries on transient failure)."""
     if not bot_token or not chat_id or str(chat_id) == "0":
         return
-    try:
-        payload: Dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
+    base_payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if download_url:
+        base_payload["reply_markup"] = {
+            "inline_keyboard": [
+                [{"text": "🚀 تحميل ومشاهدة البث المسجل", "url": download_url}],
+            ]
         }
-        if download_url:
-            payload["reply_markup"] = {
-                "inline_keyboard": [
-                    [{"text": "🚀 تحميل ومشاهدة البث المسجل", "url": download_url}],
-                ]
-            }
-        
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload).encode("utf-8"),
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
-    except Exception as e:
-        logger.error(f"Failed to send Telegram notification: {e}")
+
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(base_payload).encode("utf-8"),
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+            return
+        except urllib.error.HTTPError as e:
+            logger.error(f"Telegram notification HTTP {e.code} (attempt {attempt + 1}): {e}")
+            if e.code == 400 and "parse_mode" in base_payload:
+                base_payload.pop("parse_mode", None)
+                continue
+        except Exception as e:
+            logger.error(f"Failed to send Telegram notification (attempt {attempt + 1}): {e}")
+        if attempt < 2:
+            time.sleep(1.5 * (attempt + 1))
 
 
 class RecordingJob:
@@ -581,6 +642,7 @@ class RecordingJob:
         self.watch_mode = watch_mode
         self.start_time = time.time()
         self.stop_requested = False
+        self._stop_lock = threading.Lock()
         self.process: Optional[subprocess.Popen] = None
         
         now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -600,10 +662,6 @@ class RecordingJob:
         clean_id = self.identifier.strip("_")
         if clean_id and clean_id not in targets:
             targets.append(clean_id)
-        if "_" in self.identifier:
-            for part in self.identifier.split("_"):
-                if part and part not in targets:
-                    targets.append(part)
 
         while not self.stop_requested and (self.process is None or self.process.poll() is None):
             for tgt in targets:
@@ -618,33 +676,47 @@ class RecordingJob:
                             return
                 except Exception:
                     pass
-            # Ask the Worker every 40s (each poll costs a KV read on the free plan).
-            for _ in range(40):
+            # Poll every 20s to balance /stop responsiveness against KV free-tier reads.
+            for _ in range(20):
                 if self.stop_requested or (self.process is not None and self.process.poll() is not None):
                     return
                 time.sleep(1)
 
     def stop(self):
         self.stop_requested = True
-        if self.process and self.process.poll() is None:
-            try:
-                logger.info(f"Gracefully stopping recording process for {self.identifier}...")
-                if self.process.stdin:
-                    try:
-                        self.process.stdin.write(b"q\n")
-                        self.process.stdin.flush()
-                    except Exception:
-                        pass
-                self.process.wait(timeout=12)
-            except Exception:
+        with self._stop_lock:
+            proc = self.process
+            if proc and proc.poll() is None:
                 try:
-                    self.process.terminate()
-                    self.process.wait(timeout=5)
+                    logger.info(f"Gracefully stopping recording process for {self.identifier}...")
+                    if proc.stdin:
+                        try:
+                            proc.stdin.write(b"q\n")
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+                    # Send SIGINT to the process group so yt-dlp and child ffmpeg flush MP4 headers cleanly.
+                    if os.name != "nt":
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                        except Exception:
+                            pass
+                    proc.wait(timeout=15)
                 except Exception:
                     try:
-                        self.process.kill()
+                        if os.name != "nt":
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        else:
+                            proc.terminate()
+                        proc.wait(timeout=5)
                     except Exception:
-                        pass
+                        try:
+                            if os.name != "nt":
+                                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            else:
+                                proc.kill()
+                        except Exception:
+                            pass
 
     def _run_with_watchdog(self, cmd: list, log_path: Path, startup_timeout: int = 35) -> int:
         """
@@ -662,6 +734,7 @@ class RecordingJob:
                     stdin=subprocess.PIPE,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
+                    start_new_session=(os.name != "nt"),
                 )
 
             started_writing = False
@@ -1064,7 +1137,7 @@ class RecordingJob:
         try:
             worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
             clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}&platform={urllib.parse.quote(self.platform)}"
-            req = urllib.request.Request(clear_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            req = urllib.request.Request(clear_url, headers=_recorder_headers(self.bot_token))
             with urllib.request.urlopen(req, timeout=5) as resp:
                 resp.read()
         except Exception:
@@ -1074,6 +1147,16 @@ class RecordingJob:
         with jobs_lock:
             if self.identifier in active_jobs:
                 del active_jobs[self.identifier]
+
+        # Recover partial yt-dlp recording if interrupted before finalizing rename.
+        if not self.output_path.exists() or self.output_path.stat().st_size <= 10 * 1024:
+            part_path = Path(f"{self.output_path}.part")
+            if part_path.exists() and part_path.stat().st_size > 10 * 1024:
+                try:
+                    part_path.replace(self.output_path)
+                    logger.info(f"Recovered partial MP4 file: {self.output_path.name}")
+                except Exception as e:
+                    logger.warning(f"Failed recovering .part file: {e}")
 
         file_exists = self.output_path.exists() and self.output_path.stat().st_size > 10 * 1024
         platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else ("Stripchat" if self.platform == "stripchat" else "Live"))
@@ -1136,12 +1219,23 @@ class RecordingJob:
         logger.info(f"Uploaded URL for {self.identifier}: {download_url}")
 
         if download_url:
+            save_to_worker_archive(
+                self.bot_token,
+                self.chat_id,
+                self.platform,
+                self.identifier,
+                download_url,
+                size_str,
+                duration_str,
+                "recorder",
+            )
             msg = (
                 f"✅ <b>تم اكتمال تسجيل بث {platform_name} بنجاح!</b>\n\n"
                 f"👤 <b>الحساب:</b> <code>{self.identifier}</code>\n"
                 f"⏱️ <b>المدة:</b> {duration_str}\n"
                 f"📦 <b>الحجم:</b> {size_str}\n"
-                f"🔗 <b>الرابط المباشر للمشاهدة والتحميل السريع:</b>\n{download_url}"
+                f"🔗 <b>الرابط المباشر للمشاهدة والتحميل السريع:</b>\n{download_url}\n"
+                f"🗄️ <i>تم حفظ الرابط تلقائياً في /archive</i>"
             )
         else:
             msg = (
@@ -1241,11 +1335,12 @@ if __name__ == "__main__":
 
     cli_target = sys.argv[1]
     cli_chat = sys.argv[2]
-    # The bot token never travels on the command line (it would show up in
-    # process lists and CI logs). It comes from the BOT_TOKEN environment
-    # variable, set from a GitHub secret by the workflow.
-    cli_token = os.getenv("BOT_TOKEN", "")
-    cli_watch = (sys.argv[3] if len(sys.argv) > 3 else os.getenv("WATCH_MODE", "0")).strip().lower() in ("1", "true", "watch")
+    arg3 = sys.argv[3] if len(sys.argv) > 3 else ""
+    cli_token = os.getenv("BOT_TOKEN", "").strip() or (arg3 if ":" in arg3 else "")
+    watch_raw = (sys.argv[4] if len(sys.argv) > 4 else "") if ":" in arg3 else arg3
+    if not watch_raw:
+        watch_raw = os.getenv("WATCH_MODE", "0")
+    cli_watch = watch_raw.strip().lower() in ("1", "true", "watch")
 
     platform, identifier, stream_url = parse_stream_target(cli_target)
     if platform == "unknown":

@@ -206,8 +206,7 @@ if __name__ == "__main__":
     cli_start = sys.argv[2]
     cli_end = sys.argv[3]
     cli_chat = sys.argv[4]
-    # The bot token comes from the BOT_TOKEN environment variable (GitHub
-    # secret), never from argv: argv shows up in process lists and CI logs.
-    cli_token = os.getenv("BOT_TOKEN", "")
+    arg5 = sys.argv[5] if len(sys.argv) > 5 else ""
+    cli_token = os.getenv("BOT_TOKEN", "").strip() or (arg5 if ":" in arg5 else "")
 
     trim_video(cli_url, cli_start, cli_end, cli_chat, cli_token)

@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { apiRoute } from './routes/api'
+import { archivePageRoute } from './routes/archive-page'
 import { fileRoute } from './routes/file'
 import { telegramWebhook } from './telegram/webhook'
 import { getStore } from './store'
@@ -11,6 +12,7 @@ const app = new Hono<{ Bindings: Env }>()
 
 app.route('/api', apiRoute)
 app.route('/api', fileRoute)
+app.route('/archive', archivePageRoute)
 
 app.post('/telegram/webhook/:secret', telegramWebhook)
 app.get('/telegram/webhook/:secret', (c) => c.text('ok'))

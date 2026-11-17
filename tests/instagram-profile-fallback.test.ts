@@ -180,6 +180,78 @@ describe('resolveInstagramProfile fallback chain', () => {
     expect(result.photoCount).toBe(2)
     expect(result.truncated).toBe(true)
   })
+  it('prefers free IG_COOKIE archive over paid Apify when PROFILE_SOURCE=api, and falls back to Apify on cookie failure', async () => {
+    const calls: string[] = []
+    stubFetch((url) => {
+      calls.push(url)
+      if (url.includes('/embed/')) return new Response(LOGIN_WALL_HTML, { status: 200 })
+      if (url.includes('web_profile_info')) {
+        return json({
+          data: {
+            user: {
+              id: '12345',
+              username: 'natgeo',
+              edge_followed_by: { count: 10 },
+              edge_follow: { count: 2 },
+              edge_owner_to_timeline_media: {
+                count: 1,
+                edges: [{ node: { shortcode: 'P1', display_url: PHOTO_ONE, is_video: false } }],
+                page_info: { has_next_page: false },
+              },
+              profile_pic_url_hd: AVATAR_HD,
+            },
+          },
+        })
+      }
+      if (url === 'https://www.instagram.com/') {
+        return new Response('<html>["DTSGInitialData",[],{"token":"DTSG123"}]</html>', { status: 200 })
+      }
+      if (url.includes('/api/graphql')) {
+        return json({ data: { user: { username: 'natgeo', hd_profile_pic_url_info: { url: AVATAR_HD } } } })
+      }
+      if (url.includes('apify.com')) {
+        return json([{ type: 'Image', displayUrl: PHOTO_TWO }])
+      }
+      return new Response('not found', { status: 404 })
+    })
+
+    const cookieResult = await resolveInstagramProfile({
+      username: 'natgeo',
+      env: { ...SESSION, PROFILE_SOURCE: 'api', IG_API_KEY: 'apify-k', IG_PROVIDER: 'apify' } as Env,
+      withPhotos: true,
+      maxItems: 10,
+    })
+    expect(cookieResult.photos.map((p) => p.url)).toEqual([PHOTO_ONE])
+    expect(calls.some((u) => u.includes('apify.com'))).toBe(false)
+
+    // When cookie returns no archive posts (or fails), fall back to Apify.
+    calls.length = 0
+    stubFetch((url) => {
+      calls.push(url)
+      if (url.includes('/embed/')) return new Response(LOGIN_WALL_HTML, { status: 200 })
+      if (url.includes('web_profile_info')) return new Response('expired', { status: 401 })
+      if (url.includes('apify.com') && url.includes('details') === false) {
+        return json([
+          {
+            username: 'natgeo',
+            profilePicUrlHD: AVATAR_HD,
+            type: 'Image',
+            displayUrl: PHOTO_TWO,
+          },
+        ])
+      }
+      return new Response('not found', { status: 404 })
+    })
+
+    const apifyFallback = await resolveInstagramProfile({
+      username: 'natgeo',
+      env: { ...SESSION, PROFILE_SOURCE: 'api', IG_API_KEY: 'apify-k', IG_PROVIDER: 'apify' } as Env,
+      withPhotos: true,
+      maxItems: 10,
+    })
+    expect(apifyFallback.photos.map((p) => p.url)).toEqual([PHOTO_TWO])
+    expect(calls.some((u) => u.includes('apify.com'))).toBe(true)
+  })
 })
 
 describe('fetchProfileEmbed display_url fallback', () => {

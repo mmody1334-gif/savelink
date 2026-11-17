@@ -1,5 +1,6 @@
 import type { Context } from 'hono'
-import { maxUploadBytes, profileMaxItems, rateLimitPerMin } from '../config'
+import { maxUploadBytes, profileMaxItems, publicBase, rateLimitPerMin } from '../config'
+import { listArchiveEntries, signArchivePageUrl, type ArchiveEntry } from '../archive'
 import { ResolveError, errorMessage } from '../errors'
 import { signFileUrl } from '../files'
 import { resolveInstagramProfile, fetchArchivePage, type InstagramProfileResult } from '../instagram-profile'
@@ -649,6 +650,12 @@ async function handleCommand(
     }
     case 'stop': {
       await handleStopCommand(tg, message, rest, lang, env, store, origin)
+      return
+    }
+    case 'archive':
+    case 'links':
+    case 'recordings': {
+      await handleRecordingsArchiveCommand(tg, message, rest, lang, env, store, origin)
       return
     }
     case 'watch': {
@@ -3138,9 +3145,14 @@ async function handleStopCommand(
       chat_id: chatId,
       message_id: statusMsg.message_id,
       text: lang === 'ar'
-        ? `⏹️ تم طلب إيقاف التسجيل للموديل <b>${escapeHtml(model)}</b>.\nجاري تجهيز الفيديو ورفعه، سيصلك الرابط خلال لحظات.`
-        : `⏹️ Stop requested. Processing and uploading video... Link will arrive shortly.`,
+        ? `⏹️ تم طلب إيقاف التسجيل للموديل <b>${escapeHtml(model)}</b>.\nجاري تجهيز الفيديو ورفعه، سيصلك الرابط خلال لحظات — أو تفقّد الأرشيف لاحقاً.`
+        : `⏹️ Stop requested. Processing and uploading video... Check the archive if a message doesn't arrive.`,
       parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: lang === 'ar' ? '🗄️ أرشيف التسجيلات' : '🗄️ Recordings Archive', callback_data: 'arch|p|0|' }],
+        ],
+      },
     })
   } catch (error: any) {
     await tg.safeEdit('editMessageText', {
@@ -3198,9 +3210,14 @@ async function handleRecordCallback(
         chat_id: chatId,
         message_id: messageId,
         text: lang === 'ar'
-          ? `⏹️ تم إيقاف تسجيل <b>${escapeHtml(model)}</b> بنجاح!\nجاري تجهيز ورفع الفيديو، ستصلك رسالة بالرابط فوراً.`
+          ? `⏹️ تم إيقاف تسجيل <b>${escapeHtml(model)}</b> بنجاح!\nجاري تجهيز ورفع الفيديو، ستصلك رسالة بالرابط فوراً أو تجده في الأرشيف.`
           : `⏹️ Recording stopped for <b>${escapeHtml(model)}</b>. Video is being uploaded...`,
         parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: lang === 'ar' ? '🗄️ أرشيف التسجيلات' : '🗄️ Recordings Archive', callback_data: 'arch|p|0|' }],
+          ],
+        },
       })
     } catch (err: any) {
       await answer(tg, query?.id, err.message, true)
@@ -3237,6 +3254,158 @@ async function handleRecordCallback(
       await answer(tg, query?.id, err.message, true)
     }
   }
+}
+
+const ARCHIVE_PAGE_SIZE = 6
+
+function formatArchiveDate(ms: number): string {
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime())) return '—'
+  const y = date.getUTCFullYear()
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(date.getUTCDate()).padStart(2, '0')
+  const hh = String(date.getUTCHours()).padStart(2, '0')
+  const mm = String(date.getUTCMinutes()).padStart(2, '0')
+  return `${y}-${m}-${d} ${hh}:${mm} UTC`
+}
+
+function archivePlatformBadge(platform: ArchiveEntry['platform']): string {
+  if (platform === 'chaturbate') return '🔴 Chaturbate'
+  if (platform === 'tiktok') return '🎵 TikTok'
+  if (platform === 'stripchat') return '🟣 Stripchat'
+  return '🎥 Live'
+}
+
+async function renderRecordingsArchiveMessage(
+  store: Store,
+  chatId: number,
+  page: number,
+  query: string,
+  lang: Lang,
+  env: Env,
+  origin: string,
+): Promise<{ text: string; reply_markup: InlineKeyboard }> {
+  const cleanQuery = query.trim().replace(/\|/g, '').slice(0, 24)
+  const entries = await listArchiveEntries(store, chatId, cleanQuery)
+  const total = entries.length
+  const totalPages = Math.max(1, Math.ceil(total / ARCHIVE_PAGE_SIZE))
+  const safePage = Math.max(0, Math.min(page, totalPages - 1))
+  const slice = entries.slice(safePage * ARCHIVE_PAGE_SIZE, (safePage + 1) * ARCHIVE_PAGE_SIZE)
+
+  const header = cleanQuery
+    ? (lang === 'ar'
+        ? `🗄️ <b>أرشيف التسجيلات — بحث:</b> <code>${escapeHtml(cleanQuery)}</code> (${total})`
+        : `🗄️ <b>Recordings Archive — Filter:</b> <code>${escapeHtml(cleanQuery)}</code> (${total})`)
+    : (lang === 'ar'
+        ? `🗄️ <b>أرشيف روابط التسجيلات</b> (${total})`
+        : `🗄️ <b>Recordings Link Archive</b> (${total})`)
+
+  let text = header
+  if (!total) {
+    text += cleanQuery
+      ? (lang === 'ar'
+          ? `\n\nلا توجد تسجيلات مطابقة لـ <code>${escapeHtml(cleanQuery)}</code>.\nجرب <code>/archive</code> لعرض كل الروابط.`
+          : `\n\nNo recordings match <code>${escapeHtml(cleanQuery)}</code>.\nTry <code>/archive</code> for all links.`)
+      : (lang === 'ar'
+          ? `\n\nالأرشيف فارغ حالياً.\nكل بث يتم تسجيله أو إيقافه (Chaturbate / TikTok / Stripchat) سيُحفظ رابطه هنا تلقائياً.\n\n💡 للبحث داخل الأرشيف: <code>/archive اسم_الموديل</code>`
+          : `\n\nArchive is empty.\nEvery completed or stopped cloud recording link will be saved here automatically.`)
+  } else {
+    const blocks = slice.map((entry, idx) => {
+      const num = safePage * ARCHIVE_PAGE_SIZE + idx + 1
+      const meta = [entry.size, entry.duration, formatArchiveDate(entry.createdAt)].filter(Boolean).join(' • ')
+      const linkText = lang === 'ar' ? '🔗 مشاهدة وتحميل البث' : '🔗 Watch & Download'
+      return (
+        `<b>${num}.</b> ${archivePlatformBadge(entry.platform)} — <code>${escapeHtml(entry.model)}</code>\n` +
+        `   📦 ${escapeHtml(meta)}\n` +
+        `   <a href="${escapeHtml(entry.url)}">${linkText}</a>`
+      )
+    })
+    text += `\n\n${blocks.join('\n\n')}`
+    if (totalPages > 1) {
+      text += lang === 'ar'
+        ? `\n\n📄 صفحة ${safePage + 1} من ${totalPages} • للبحث: <code>/archive اسم_الموديل</code>`
+        : `\n\n📄 Page ${safePage + 1} of ${totalPages}`
+    }
+  }
+
+  const rows: InlineKeyboard['inline_keyboard'] = []
+  if (totalPages > 1) {
+    const navRow: InlineKeyboard['inline_keyboard'][number] = []
+    if (safePage > 0) {
+      navRow.push({
+        text: lang === 'ar' ? '⬅️ السابق' : '⬅️ Prev',
+        callback_data: `arch|p|${safePage - 1}|${cleanQuery}`,
+      })
+    }
+    navRow.push({ text: `${safePage + 1}/${totalPages}`, callback_data: `arch|r|${safePage}|${cleanQuery}` })
+    if (safePage < totalPages - 1) {
+      navRow.push({
+        text: lang === 'ar' ? 'التالي ➡️' : 'Next ➡️',
+        callback_data: `arch|p|${safePage + 1}|${cleanQuery}`,
+      })
+    }
+    rows.push(navRow)
+  }
+
+  const actionRow: InlineKeyboard['inline_keyboard'][number] = [
+    { text: lang === 'ar' ? '🔄 تحديث الأرشيف' : '🔄 Refresh Archive', callback_data: `arch|r|${safePage}|${cleanQuery}` },
+  ]
+  const baseUrl = publicBase(env, origin)
+  if (/^https:\/\//i.test(baseUrl)) {
+    const webUrl = await signArchivePageUrl(chatId, env, origin)
+    actionRow.push({
+      text: lang === 'ar' ? '🌐 صفحة الأرشيف الكاملة' : '🌐 Full Archive Page',
+      url: webUrl,
+    })
+  }
+  rows.push(actionRow)
+
+  return { text, reply_markup: { inline_keyboard: rows } }
+}
+
+async function handleRecordingsArchiveCommand(
+  tg: TelegramApi,
+  message: TgMessage,
+  rest: string,
+  lang: Lang,
+  env: Env,
+  store: Store,
+  origin: string,
+): Promise<void> {
+  const { text, reply_markup } = await renderRecordingsArchiveMessage(store, message.chat.id, 0, rest, lang, env, origin)
+  await tg.call('sendMessage', {
+    chat_id: message.chat.id,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_to_message_id: message.message_id,
+    reply_markup,
+  })
+}
+
+async function handleRecordingsArchiveCallback(
+  tg: TelegramApi,
+  query: any,
+  chatId: number,
+  messageId: number,
+  parts: string[],
+  lang: Lang,
+  env: Env,
+  store: Store,
+  origin: string,
+): Promise<void> {
+  const page = Number(parts[2] || '0') || 0
+  const filter = parts.slice(3).join('|')
+  await answer(tg, query?.id, '')
+  const { text, reply_markup } = await renderRecordingsArchiveMessage(store, chatId, page, filter, lang, env, origin)
+  await tg.safeEdit('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup,
+  })
 }
 
 
@@ -4720,6 +4889,11 @@ async function handleCallback(
     return
   }
 
+  if (tag === 'arch') {
+    await handleRecordingsArchiveCallback(tg, query, chatId, messageId, parts, lang, env, store, origin)
+    return
+  }
+
   if (tag.startsWith('menu')) {
     await handleMenuCallback(tg, query, chatId, messageId, parts, lang)
     return
@@ -5340,6 +5514,7 @@ function renderMainMenu(lang: Lang): { text: string; reply_markup: InlineKeyboar
         { text: '📁 Bunkr & Erome', callback_data: 'menu|bkr_erm' },
       ],
       [
+        { text: '🗄️ أرشيف التسجيلات', callback_data: 'arch|p|0|' },
         { text: '✂️ أدوات الميديا (قص / تحويل)', callback_data: 'menu|tools' },
       ],
     ],
@@ -5389,7 +5564,8 @@ async function handleMenuCallback(
       ? `🎵 <b>ميزات تيك توك وبثوث اللايف (TikTok):</b>\n\n` +
         `• <b>تحميل الفيديوهات والسلايدات:</b> بدون علامة مائية وبأعلى وضوح مع خيار استخراج الصوت MP3.\n` +
         `• <b>تسجيل البث المباشر سحابياً (TikTok Live):</b> أرسل رابط البث (مثل <code>vt.tiktok.com</code>) أو اكتب <code>/record @username</code> ليبدأ التسجيل فوراً على سيرفر سحابي خارجي.\n` +
-        `• <b>المراقبة التلقائية الذكية:</b> <code>/watch @username</code> – يراقب الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق في الخلفية، وفور فتح اللايف يسجله تلقائياً ويرسله لك!`
+        `• <b>المراقبة التلقائية الذكية:</b> <code>/watch @username</code> – يراقب الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق في الخلفية، وفور فتح اللايف يسجله تلقائياً ويرسله لك!\n` +
+        `• <b>أرشيف التسجيلات:</b> <code>/archive</code> – يعرض كل روابط البثوث المسجلة أو المتوقفة.`
       : `🎵 <b>TikTok & Live Features:</b>\n\n` +
         `• <b>Watermark-free Downloads:</b> Videos and image sliders in full original quality.\n` +
         `• <b>Audio Extraction:</b> Download audio track as MP3 with one click.\n` +
@@ -5421,11 +5597,13 @@ async function handleMenuCallback(
         `• <b>تسجيل سحابي غير محدود:</b> بدون استهلاك باقتك أو بطارية هاتفك، التسجيل يتم على خوادم مايكروسوفت السريعة (GitHub Actions).\n` +
         `• <b>أمر التسجيل الفوري:</b> <code>/record <model></code> لبدء تسجيل البث فوراً.\n` +
         `• <b>المراقبة التلقائية (Auto-Record):</b> <code>/watch <model></code> لتسجيل الموديل تلقائياً أول ما تفتح لايف.\n` +
+        `• <b>أرشيف الروابط المحفوظة:</b> <code>/archive</code> لعرض كل روابط التسجيلات حتى لو توقف البث يدوياً بـ <code>/stop</code>.\n` +
         `• <b>رفع مباشر وسريع:</b> إرسال المقطع مباشرة بالبوت (حتى 50MB) أو رابط Pixeldrain حتى 10GB + كليب معاينة 30 ثانية.`
       : `🔴 <b>Chaturbate Features:</b>\n\n` +
         `• <b>Cloud Recording:</b> Unlimited recording without using your battery or data.\n` +
         `• <b>Direct Record:</b> <code>/record <model></code> to record live stream immediately.\n` +
         `• <b>Auto-Record Watcher:</b> <code>/watch <model></code> monitors creator and records automatically.\n` +
+        `• <b>Links Archive:</b> <code>/archive</code> lists every saved recording link even after manual <code>/stop</code>.\n` +
         `• <b>Fast Uploads:</b> Direct Telegram video upload (up to 50MB) + 10GB Pixeldrain link + 30s preview clip.`
   } else if (target === 'bkr_erm') {
     text = lang === 'ar'

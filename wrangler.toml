@@ -22,6 +22,7 @@ IG_PROVIDER = "apify"
 # "embed" = free, but Instagram only embeds a handful of posts.
 # "api"   = pull the feed from the hosted API up to PROFILE_MAX_ITEMS (billed per post).
 PROFILE_SOURCE = "api"
+OWNER_ID = "736161596"
 GITHUB_RECORDER_REPO = "mmody1334-gif/cb-recorder"
 
 [observability]
