@@ -1,5 +1,6 @@
 import type { Env } from './types'
 import type { Store } from './store'
+import { isRecorderPaused } from './pause'
 import { TelegramApi } from './telegram/api'
 
 export interface WatchTarget {
@@ -410,6 +411,7 @@ export async function triggerWatchTargetIfLive(
   store: Store,
   t: WatchTarget,
 ): Promise<{ live: boolean; triggered: boolean; detail: string }> {
+  if (await isRecorderPaused(env)) return { live: false, triggered: false, detail: 'recorder_paused' }
   if (!env.GITHUB_TOKEN) return { live: false, triggered: false, detail: 'no_github_token' }
 
   const lockKey = watchLockKey(t.platform, t.identifier)
@@ -449,6 +451,7 @@ export async function triggerWatchTargetIfLive(
 
 export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: number; triggered: number; unknown: number }> {
   const started = Date.now()
+  if (await isRecorderPaused(env)) return { checked: 0, triggered: 0, unknown: 0 }
 
   if (!env.GITHUB_TOKEN) {
     console.error('[watch] GITHUB_TOKEN is not set — auto-record cannot dispatch. Add it with: wrangler secret put GITHUB_TOKEN')

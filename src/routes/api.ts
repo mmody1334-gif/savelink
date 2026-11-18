@@ -9,7 +9,7 @@ import {
   listArchiveEntries,
 } from '../archive'
 import type { Env } from '../types'
-import { isPaused } from '../pause'
+import { isPaused, isRecorderPaused } from '../pause'
 import {
   parseWatchTarget,
   checkTargetLive,
@@ -95,6 +95,9 @@ export function invalidateSignalMemo(target: string): void {
 }
 
 apiRoute.get('/record/signal', async (c) => {
+  if (await isRecorderPaused(c.env)) {
+    return c.json({ stop: true, recorderPaused: true })
+  }
   const target = (c.req.query('target') || '').toLowerCase().trim().replace(/^@/, '')
   if (!target) return c.json({ stop: false })
   if (c.env.CACHE) {

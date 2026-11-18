@@ -23,7 +23,16 @@ import {
 } from '../facebook-stories'
 import { handleMovieCallback, handleMovieCommand } from './movie-handlers'
 import { handleBypassCommand } from './bypass-handlers'
-import { isPaused, setPaused, canControlPause, isPauseConfigured, cancelAllGitHubRuns } from '../pause'
+import {
+  isPaused,
+  isRecorderPaused,
+  setPaused,
+  setRecorderPaused,
+  canControlPause,
+  isPauseConfigured,
+  cancelAllGitHubRuns,
+  stopRecorderGitHubRuns,
+} from '../pause'
 import { invalidateSignalMemo } from '../routes/api'
 import {
   handleAiCommand,
@@ -653,6 +662,10 @@ async function handleCommand(
       await handleStopCommand(tg, message, rest, lang, env, store, origin)
       return
     }
+    case 'stop_recorder': {
+      await handleStopRecorderAll(tg, message, lang, env)
+      return
+    }
     case 'archive':
     case 'links':
     case 'recordings': {
@@ -828,13 +841,19 @@ async function handleWatchCommand(
     }
 
     if (isAlreadyWatched) {
-      const alreadyOfflineMsg = lang === 'ar'
+      const pausedSuffix =
+        liveTrigger.detail === 'recorder_paused'
+          ? lang === 'ar'
+            ? `\n\n⏸️ <b>ملاحظة:</b> المسجل و<code>/watch</code> متوقفان حالياً بأمر <code>/stop recorder</code> — سيعودان للعمل تلقائياً مع أول أمر <code>/record ...</code> جديد.`
+            : `\n\n⏸️ <b>Note:</b> Recorder & <code>/watch</code> are paused by <code>/stop recorder</code> and will resume on the next <code>/record ...</code>.`
+          : ''
+      const alreadyOfflineMsg = (lang === 'ar'
         ? `ℹ️ <b>الحساب <code>${escapeHtml(target.target)}</code> موجود بالفعل في قائمة المراقبة لديك!</b>\n\n` +
           `📡 <b>الحالة الآن:</b> غير مباشر (${escapeHtml(liveTrigger.detail || 'Offline')})\n` +
           `⏱️ البوت يراقبه باستمرار في السحابة، وفور أن يفتح لايف سيبدأ التسجيل فوراً ويرسل لك إشعاراً.`
         : `ℹ️ <b>Target <code>${escapeHtml(target.target)}</code> is already in your watchlist!</b>\n\n` +
           `📡 <b>Current status:</b> Offline (${escapeHtml(liveTrigger.detail || 'Offline')})\n` +
-          `Will record automatically when live.`
+          `Will record automatically when live.`) + pausedSuffix
 
       await tg.call('sendMessage', {
         chat_id: chatId,
@@ -853,7 +872,11 @@ async function handleWatchCommand(
       ? lang === 'ar'
         ? `\n\n⚠️ <b>تنبيه:</b> التسجيل السحابي غير مهيأ (GITHUB_TOKEN غير مضبوط)، فالمراقبة وحدها لن تبدأ أي تسجيل.`
         : `\n\n⚠️ <b>Warning:</b> cloud recording is not configured (GITHUB_TOKEN is missing), so watching alone will not start any recording.`
-      : ''
+      : liveTrigger?.detail === 'recorder_paused'
+        ? lang === 'ar'
+          ? `\n\n⏸️ <b>ملاحظة:</b> المسجل و<code>/watch</code> متوقفان حالياً بأمر <code>/stop recorder</code> — سيعودان للعمل تلقائياً مع أول أمر <code>/record ...</code> جديد.`
+          : `\n\n⏸️ <b>Note:</b> Recorder & <code>/watch</code> are paused by <code>/stop recorder</code> and will resume on the next <code>/record ...</code>.`
+        : ''
   const successMsg =
     (lang === 'ar'
       ? `✅ <b>تمت الإضافة لقائمة المراقبة والتسجيل التلقائي!</b>\n\n` +
@@ -2905,6 +2928,30 @@ async function handleRecordCommand(
     return
   }
 
+  let resumedNote = ''
+  if (await isRecorderPaused(env)) {
+    if (isPauseConfigured(env) && !canControlPause(env, message.from?.id)) {
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: lang === 'ar'
+          ? '⏸️ المسجل متوقف حالياً بواسطة المالك.'
+          : '⏸️ Recording is currently paused by the owner.',
+        reply_to_message_id: message.message_id,
+      })
+      return
+    }
+    await setRecorderPaused(env, false)
+    resumedNote = lang === 'ar'
+      ? '\n▶️ <i>تم إعادة تفعيل المسجل والمراقبة التلقائية (/watch) تلقائياً.</i>'
+      : '\n▶️ <i>Recorder & /watch resumed automatically.</i>'
+  }
+
+  const cleanStopKey = model.replace(/^@/, '').toLowerCase()
+  if (await store.get(`stop:${cleanStopKey}`)) {
+    await store.delete(`stop:${cleanStopKey}`)
+    invalidateSignalMemo(cleanStopKey)
+  }
+
   const statusMsg = await tg.call<{ message_id: number }>('sendMessage', {
     chat_id: chatId,
     text: lang === 'ar' ? `⏳ جاري فحص بث <b>${escapeHtml(model)}</b> (${platformLabel}) وبدء التسجيل…` : `⏳ Checking stream for <b>${escapeHtml(model)}</b>…`,
@@ -2928,11 +2975,11 @@ async function handleRecordCommand(
           await tg.safeEdit('editMessageText', {
             chat_id: chatId,
             message_id: statusMsg.message_id,
-            text: lang === 'ar'
+            text: (lang === 'ar'
               ? `🔒 <b>الموديل ${escapeHtml(model)} حالياً في عرض خاص مشفر (Private Show / PVT).</b>\n\n` +
                 `البثوث الخاصة تكون مشفرة ومغلقة وتتطلب حساباً مدفوعاً بتوكنات داخل الموقع ولا يمكن التقاطها كبث عام.\n\n` +
                 `💡 <b>الحل التلقائي:</b> فعل المراقبة التلقائية الآن:\n<code>/watch ${escapeHtml(model)}</code>\nوسيقوم البوت بالبدء بتسجيل البث تلقائياً فور انتهائها من الخاص وعودتها للبث العام المجاني!`
-              : `🔒 <b>${escapeHtml(model)} is currently in a Private Show (PVT).</b>\nPrivate sessions cannot be captured without paid token authentication.\nUse <code>/watch ${escapeHtml(model)}</code> to record automatically once public stream resumes!`,
+              : `🔒 <b>${escapeHtml(model)} is currently in a Private Show (PVT).</b>\nPrivate sessions cannot be captured without paid token authentication.\nUse <code>/watch ${escapeHtml(model)}</code> to record automatically once public stream resumes!`) + resumedNote,
             parse_mode: 'HTML',
           })
           return
@@ -2963,12 +3010,12 @@ async function handleRecordCommand(
             await tg.safeEdit('editMessageText', {
               chat_id: chatId,
               message_id: statusMsg.message_id,
-              text: lang === 'ar'
+              text: (lang === 'ar'
                 ? `⚠️ <b>الموديل ${escapeHtml(model)} غير متصلة حالياً (Offline).</b>\n\n` +
                   `💡 <b>لتسجيل البث فور بدئه بدون انتظار:</b>\n` +
                   `اكتب: <code>/watch ${escapeHtml(model)}</code>\n` +
                   `سيقوم البوت بمراقبة الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
-                : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch ${escapeHtml(model)}</code> to record automatically once live.`,
+                : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch ${escapeHtml(model)}</code> to record automatically once live.`) + resumedNote,
               parse_mode: 'HTML',
             })
             return
@@ -2998,11 +3045,11 @@ async function handleRecordCommand(
           await tg.safeEdit('editMessageText', {
             chat_id: chatId,
             message_id: statusMsg.message_id,
-            text: lang === 'ar'
+            text: (lang === 'ar'
               ? `🔒 <b>الموديل ${escapeHtml(model)} حالياً في عرض خاص مشفر (Private Show / PVT).</b>\n\n` +
                 `البثوث الخاصة تكون مشفرة ومغلقة وتتطلب حساباً مدفوعاً بتوكنات داخل الموقع ولا يمكن التقاطها كبث عام.\n\n` +
                 `💡 <b>الحل التلقائي:</b> فعل المراقبة التلقائية الآن:\n<code>/watch https://stripchat.com/${escapeHtml(model)}</code>\nوسيقوم البوت بالبدء بتسجيل البث تلقائياً فور انتهائها من الخاص وعودتها للبث العام المجاني!`
-              : `🔒 <b>${escapeHtml(model)} is currently in a Private Show (PVT).</b>\nUse <code>/watch https://stripchat.com/${escapeHtml(model)}</code> to record automatically once public stream resumes!`,
+              : `🔒 <b>${escapeHtml(model)} is currently in a Private Show (PVT).</b>\nUse <code>/watch https://stripchat.com/${escapeHtml(model)}</code> to record automatically once public stream resumes!`) + resumedNote,
             parse_mode: 'HTML',
           })
           return
@@ -3011,12 +3058,12 @@ async function handleRecordCommand(
           await tg.safeEdit('editMessageText', {
             chat_id: chatId,
             message_id: statusMsg.message_id,
-            text: lang === 'ar'
+            text: (lang === 'ar'
               ? `⚠️ <b>الموديل ${escapeHtml(model)} غير متصلة حالياً (Offline).</b>\n\n` +
                 `💡 <b>لتسجيل البث فور بدئه بدون انتظار:</b>\n` +
                 `اكتب: <code>/watch https://stripchat.com/${escapeHtml(model)}</code>\n` +
                 `سيقوم البوت بمراقبة الحساب كل ${WATCH_CHECK_INTERVAL_MINUTES} دقائق، وأول ما تفتح لايف عام سيسجله السيرفر تلقائياً ويرسل لك الرابط!`
-              : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch https://stripchat.com/${escapeHtml(model)}</code> to record automatically once live.`,
+              : `⚠️ <b>${escapeHtml(model)} is currently Offline.</b>\nUse <code>/watch https://stripchat.com/${escapeHtml(model)}</code> to record automatically once live.`) + resumedNote,
             parse_mode: 'HTML',
           })
           return
@@ -3049,7 +3096,7 @@ async function handleRecordCommand(
       }
     }
 
-    const startMsg = lang === 'ar'
+    const startMsg = (lang === 'ar'
       ? `🔴 <b>جاري الاتصال وتسجيل بث ${platformLabel} في السحابة!</b>\n\n` +
         `👤 <b>المعرف:</b> <code>${escapeHtml(model)}</code>\n` +
         `☁️ <b>الخادم السحابي:</b> سيرفر مايكروسوفت (GitHub Actions) فائق السرعة\n` +
@@ -3059,7 +3106,7 @@ async function handleRecordCommand(
         `👤 <b>Target:</b> <code>${escapeHtml(model)}</code>\n` +
         `☁️ <b>Cloud Runner:</b> High-speed GitHub Actions\n` +
         `⏳ <b>Status:</b> Recording in background...\n` +
-        `💡 You can turn off your device. Video will be uploaded and link sent when done.`
+        `💡 You can turn off your device. Video will be uploaded and link sent when done.`) + resumedNote
 
     const stopTarget = model.length > 30 ? model.slice(0, 30) : model
     const kb: InlineKeyboard = {
@@ -3088,6 +3135,81 @@ async function handleRecordCommand(
   }
 }
 
+async function handleStopRecorderAll(
+  tg: TelegramApi,
+  message: TgMessage,
+  lang: Lang,
+  env: Env,
+): Promise<void> {
+  const chatId = message.chat.id
+  if (!isPauseConfigured(env)) {
+    await tg.call('sendMessage', {
+      chat_id: chatId,
+      text:
+        '⛔ <b>أمر إيقاف المسجل معطّل.</b>\n\n' +
+        'لم يتم ضبط <code>OWNER_ID</code> في إعدادات الووركر.',
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+    })
+    return
+  }
+  if (!canControlPause(env, message.from?.id)) return
+
+  await setRecorderPaused(env, true, message.from?.id)
+  let gh = { running: 0, cancelledQueued: 0 }
+  try {
+    gh = await stopRecorderGitHubRuns(env)
+  } catch (error) {
+    console.error('stop recorder github error', errorMessage(error))
+  }
+
+  const endpoint = env.RECORDER_ENDPOINT || env.YTDLP_ENDPOINT
+  if (endpoint) {
+    try {
+      const base = endpoint.replace(/\/+$/, '')
+      const statRes = await fetch(`${base}/record/status`, {
+        headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
+        signal: AbortSignal.timeout(8_000),
+      })
+      if (statRes.ok) {
+        const data: any = await statRes.json()
+        for (const rec of data.recordings || []) {
+          await fetch(`${base}/record/stop`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...sidecarAuthHeaders(env) },
+            body: JSON.stringify({ url: rec.model }),
+            signal: AbortSignal.timeout(8_000),
+          }).catch(() => {})
+        }
+      }
+    } catch {}
+  }
+
+  const queuedNote = gh.cancelledQueued ? ` (وإلغاء ${gh.cancelledQueued} بالانتظار)` : ''
+  const text = lang === 'ar'
+    ? `⏹️ <b>تم إيقاف جميع التسجيلات والمراقبة التلقائية (/watch)!</b>\n\n` +
+      `• تم إرسال أمر الإيقاف والحفظ الآمن لـ <b>${gh.running}</b> تسجيل جاري${queuedNote}.\n` +
+      `• المراقبة التلقائية <code>/watch</code> متوقفة مؤقتاً.\n` +
+      `• باقي ميزات البوت تعمل بشكل طبيعي.\n\n` +
+      `▶️ <b>لإعادة التشغيل تلقائياً:</b> أرسل أي أمر تسجيل جديد مثل <code>/record اسم_الحساب</code>.`
+    : `⏹️ <b>Paused all recordings & auto-watch (/watch)!</b>\n\n` +
+      `• Safe stop signaled to <b>${gh.running}</b> active run(s)` +
+      (gh.cancelledQueued ? ` (${gh.cancelledQueued} queued cancelled)` : '') +
+      `.\n• Auto-watch is paused until you start a new <code>/record &lt;target&gt;</code>.`
+
+  await tg.call('sendMessage', {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    reply_to_message_id: message.message_id,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: lang === 'ar' ? '🗄️ أرشيف التسجيلات' : '🗄️ Recordings Archive', callback_data: 'arch|p|0|' }],
+      ],
+    },
+  })
+}
+
 async function handleStopCommand(
   tg: TelegramApi,
   message: TgMessage,
@@ -3097,6 +3219,11 @@ async function handleStopCommand(
   store: Store,
   _origin: string,
 ): Promise<void> {
+  if (rest.trim().toLowerCase() === 'recorder') {
+    await handleStopRecorderAll(tg, message, lang, env)
+    return
+  }
+
   const chatId = message.chat.id
   const hasGitHub = !!env.GITHUB_TOKEN
   const endpoint = env.RECORDER_ENDPOINT || env.YTDLP_ENDPOINT
