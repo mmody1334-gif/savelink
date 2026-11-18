@@ -169,6 +169,31 @@ export async function deleteArchiveEntry(store: Store, chatId: number, id: strin
   return true
 }
 
+export async function clearArchiveEntries(store: Store, chatId: number): Promise<number> {
+  const userKey = archiveUserKey(chatId)
+  const [userRaw, allRaw] = await Promise.all([store.get(userKey), store.get(ARCHIVE_ALL_KEY)])
+  const userList = parseEntries(userRaw)
+  const allList = parseEntries(allRaw)
+  const nextAll = allList.filter((item) => item.chatId !== chatId)
+  const removed = Math.max(userList.length, allList.length - nextAll.length)
+
+  if (removed === 0) return 0
+
+  const ops: Promise<void>[] = []
+  if (userRaw !== null) {
+    ops.push(store.delete(userKey))
+  }
+  if (allRaw !== null) {
+    if (nextAll.length === 0) {
+      ops.push(store.delete(ARCHIVE_ALL_KEY))
+    } else if (nextAll.length !== allList.length) {
+      ops.push(store.put(ARCHIVE_ALL_KEY, JSON.stringify(nextAll), ARCHIVE_TTL_SECONDS))
+    }
+  }
+  await Promise.all(ops)
+  return removed
+}
+
 function archiveSigningSecret(env: Env): string {
   return (env.SIGNING_SECRET || '').trim() || ARCHIVE_DEV_SECRET
 }

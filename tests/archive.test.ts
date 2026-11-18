@@ -6,6 +6,7 @@ import {
   MAX_ARCHIVE_ITEMS,
   addArchiveEntry,
   archiveUserKey,
+  clearArchiveEntries,
   deleteArchiveEntry,
   listArchiveEntries,
   signArchivePageUrl,
@@ -280,5 +281,234 @@ describe('Telegram /archive and /stop archive integration', () => {
     const stopEdit = tgCalls.find((c) => c.method === 'editMessageText')
     expect(stopEdit).toBeDefined()
     expect(JSON.stringify(stopEdit?.body.reply_markup)).toContain('arch|p|0|')
+  })
+
+  it('deletes web archive entries safely with token scope and renders no em-dashes', async () => {
+    const env: Env = { BOT_TOKEN, WEBHOOK_SECRET, SIGNING_SECRET }
+    const store = getStore(env)
+    const owned = await addArchiveEntry(store, {
+      chatId: 736161596,
+      platform: 'chaturbate',
+      model: 'owned_model',
+      url: 'https://pixeldrain.com/u/owned1',
+      size: '90 MB',
+    })
+    const foreign = await addArchiveEntry(store, {
+      chatId: 888,
+      platform: 'tiktok',
+      model: 'other_user',
+      url: 'https://pixeldrain.com/u/other1',
+      size: '40 MB',
+    })
+
+    const signedUrl = await signArchivePageUrl(736161596, env, 'https://example.workers.dev')
+    const token = new URL(signedUrl).searchParams.get('t') || ''
+
+    const pageRes = await archivePageRoute.request(`/?t=${encodeURIComponent(token)}`, { method: 'GET' }, env)
+    expect(pageRes.status).toBe(200)
+    const html = await pageRes.text()
+    expect(html).toContain('delete-btn')
+    expect(html).toContain(`data-id="${owned.id}"`)
+    expect(html).not.toContain('—')
+    const scriptBody = html.split('<script>')[1]?.split('</script>')[0] || ''
+    expect(() => new Function(scriptBody)).not.toThrow()
+
+    const badToken = await archivePageRoute.request(
+      '/delete',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'invalid.token', id: owned.id }),
+      },
+      env,
+    )
+    expect(badToken.status).toBe(401)
+
+    const crossUser = await archivePageRoute.request(
+      '/delete',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, id: foreign.id }),
+      },
+      env,
+    )
+    expect(crossUser.status).toBe(200)
+    expect(await crossUser.json()).toEqual({ ok: true, deleted: false })
+    expect(await listArchiveEntries(store, 888)).toHaveLength(1)
+
+    const delOk = await archivePageRoute.request(
+      '/delete',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token, id: owned.id }),
+      },
+      env,
+    )
+    expect(delOk.status).toBe(200)
+    expect(await delOk.json()).toEqual({ ok: true, deleted: true })
+    expect(await listArchiveEntries(store, 736161596)).toHaveLength(0)
+  })
+
+  it('supports Telegram platform filters, per-item delete, /archive clear, and <=64-byte callback data', async () => {
+    const tgCalls: Array<{ method: string; body: any }> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        const method = url.split('/').pop() || ''
+        const body = init?.body ? JSON.parse(String(init.body)) : {}
+        tgCalls.push({ method, body })
+        return new Response(JSON.stringify({ ok: true, result: { message_id: 71 } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }),
+    )
+
+    const env: Env = {
+      BOT_TOKEN,
+      WEBHOOK_SECRET,
+      SIGNING_SECRET,
+      PUBLIC_BASE_URL: 'https://savelink.example.workers.dev',
+    }
+    const store = getStore(env)
+    const e1 = await addArchiveEntry(store, {
+      chatId: 736161596,
+      platform: 'chaturbate',
+      model: 'cb_girl',
+      url: 'https://pixeldrain.com/u/cb1',
+      createdAt: 2000,
+    })
+    await addArchiveEntry(store, {
+      chatId: 736161596,
+      platform: 'tiktok',
+      model: 'tt_boy',
+      url: 'https://pixeldrain.com/u/tt1',
+      createdAt: 3000,
+    })
+    await addArchiveEntry(store, {
+      chatId: 888,
+      platform: 'stripchat',
+      model: 'keep_me',
+      url: 'https://pixeldrain.com/u/keep1',
+      createdAt: 4000,
+    })
+
+    // 1. Platform filters and per-item delete buttons appear cleanly
+    await worker.fetch(
+      new Request(`https://savelink.example.workers.dev/telegram/webhook/${WEBHOOK_SECRET}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 701,
+          message: {
+            message_id: 1,
+            chat: { id: 736161596, type: 'private' },
+            from: { id: 736161596, language_code: 'ar' },
+            text: '/archive',
+          },
+        }),
+      }),
+      env,
+      { waitUntil: () => {} } as any,
+    )
+    const firstMsg = tgCalls.find((c) => c.method === 'sendMessage')
+    const kb1 = JSON.stringify(firstMsg?.body.reply_markup)
+    expect(kb1).toContain('arch|p|0|chaturbate')
+    expect(kb1).toContain('arch|p|0|tiktok')
+    expect(kb1).toContain('arch|p|0|stripchat')
+    expect(kb1).toContain(`arch|d|${e1.id}|0|`)
+
+    // 2. Delete one entry via inline callback
+    await worker.fetch(
+      new Request(`https://savelink.example.workers.dev/telegram/webhook/${WEBHOOK_SECRET}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 702,
+          callback_query: {
+            id: 'cb-del-1',
+            from: { id: 736161596, language_code: 'ar' },
+            message: { message_id: 71, chat: { id: 736161596, type: 'private' } },
+            data: `arch|d|${e1.id}|0|`,
+          },
+        }),
+      }),
+      env,
+      { waitUntil: () => {} } as any,
+    )
+    expect(await listArchiveEntries(store, 736161596)).toHaveLength(1)
+
+    // 3. Long Arabic query respects Telegram 64-byte UTF-8 callback_data limit
+    await worker.fetch(
+      new Request(`https://savelink.example.workers.dev/telegram/webhook/${WEBHOOK_SECRET}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 703,
+          message: {
+            message_id: 2,
+            chat: { id: 736161596, type: 'private' },
+            from: { id: 736161596, language_code: 'ar' },
+            text: '/archive تجربة_طويلة_جداً_باللغة_العربية_للاختبار',
+          },
+        }),
+      }),
+      env,
+      { waitUntil: () => {} } as any,
+    )
+    const arSend = tgCalls.filter((c) => c.method === 'sendMessage').pop()
+    const enc = new TextEncoder()
+    for (const row of arSend?.body.reply_markup?.inline_keyboard || []) {
+      for (const btn of row) {
+        if (btn.callback_data) {
+          expect(enc.encode(btn.callback_data).length).toBeLessThanOrEqual(64)
+        }
+      }
+    }
+
+    // 4. /archive clear + confirmation only clears requester's archive
+    await worker.fetch(
+      new Request(`https://savelink.example.workers.dev/telegram/webhook/${WEBHOOK_SECRET}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 704,
+          message: {
+            message_id: 3,
+            chat: { id: 736161596, type: 'private' },
+            from: { id: 736161596, language_code: 'ar' },
+            text: '/archive clear',
+          },
+        }),
+      }),
+      env,
+      { waitUntil: () => {} } as any,
+    )
+    const clearPrompt = tgCalls.filter((c) => c.method === 'sendMessage').pop()
+    expect(JSON.stringify(clearPrompt?.body.reply_markup)).toContain('arch|clr_yes')
+
+    await worker.fetch(
+      new Request(`https://savelink.example.workers.dev/telegram/webhook/${WEBHOOK_SECRET}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          update_id: 705,
+          callback_query: {
+            id: 'cb-clr-yes',
+            from: { id: 736161596, language_code: 'ar' },
+            message: { message_id: 71, chat: { id: 736161596, type: 'private' } },
+            data: 'arch|clr_yes',
+          },
+        }),
+      }),
+      env,
+      { waitUntil: () => {} } as any,
+    )
+    expect(await listArchiveEntries(store, 736161596)).toHaveLength(0)
+    expect(await listArchiveEntries(store, 888)).toHaveLength(1)
+    expect(await clearArchiveEntries(store, 736161596)).toBe(0)
   })
 })

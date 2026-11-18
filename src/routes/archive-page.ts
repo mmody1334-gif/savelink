@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { listArchiveEntries, verifyArchivePageToken, type ArchiveEntry, type ArchivePlatform } from '../archive'
+import { deleteArchiveEntry, listArchiveEntries, verifyArchivePageToken, type ArchiveEntry, type ArchivePlatform } from '../archive'
 import { getStore } from '../store'
 import { escapeHtml } from '../telegram/i18n'
 import type { Env } from '../types'
@@ -15,7 +15,7 @@ const PLATFORM_LABELS: Record<ArchivePlatform, string> = {
 
 function formatTimestamp(ms: number): string {
   const date = new Date(ms)
-  if (Number.isNaN(date.getTime())) return '—'
+  if (Number.isNaN(date.getTime())) return '-'
   const y = date.getUTCFullYear()
   const m = String(date.getUTCMonth() + 1).padStart(2, '0')
   const d = String(date.getUTCDate()).padStart(2, '0')
@@ -26,14 +26,15 @@ function formatTimestamp(ms: number): string {
 
 function renderEntryCard(entry: ArchiveEntry): string {
   const platformLabel = PLATFORM_LABELS[entry.platform] || 'Live'
+  const idSafe = escapeHtml(entry.id)
   const modelSafe = escapeHtml(entry.model)
   const urlSafe = escapeHtml(entry.url)
-  const sizeSafe = escapeHtml(entry.size || '—')
-  const durationSafe = escapeHtml(entry.duration || '—')
+  const sizeSafe = escapeHtml(entry.size || '-')
+  const durationSafe = escapeHtml(entry.duration || '-')
   const timeSafe = escapeHtml(formatTimestamp(entry.createdAt))
   const sourceSafe = entry.source === 'uploader' ? 'احتياطي' : entry.source === 'backfill' ? 'مستورد' : 'مباشر'
 
-  return `<article class="archive-item" data-platform="${escapeHtml(entry.platform)}" data-search="${escapeHtml(`${entry.model} ${entry.platform} ${entry.url}`.toLowerCase())}">
+  return `<article class="archive-item" data-id="${idSafe}" data-platform="${escapeHtml(entry.platform)}" data-search="${escapeHtml(`${entry.model} ${entry.platform} ${entry.url}`.toLowerCase())}">
   <div class="col-model">
     <span class="badge badge-${escapeHtml(entry.platform)}">${escapeHtml(platformLabel)}</span>
     <code class="model-name" dir="ltr">${modelSafe}</code>
@@ -44,24 +45,26 @@ function renderEntryCard(entry: ArchiveEntry): string {
   <div class="col-actions">
     <a class="btn btn-primary" href="${urlSafe}" target="_blank" rel="noopener noreferrer">فتح البث</a>
     <button type="button" class="btn btn-secondary copy-btn" data-url="${urlSafe}">نسخ الرابط</button>
+    <button type="button" class="btn btn-danger delete-btn" data-id="${idSafe}" aria-label="حذف تسجيل ${modelSafe}">حذف</button>
   </div>
 </article>`
 }
 
-function renderArchiveHtml(entries: ArchiveEntry[]): string {
+function renderArchiveHtml(entries: ArchiveEntry[], token = ''): string {
   const counts: Record<string, number> = { all: entries.length, chaturbate: 0, tiktok: 0, stripchat: 0 }
   for (const entry of entries) {
     counts[entry.platform] = (counts[entry.platform] || 0) + 1
   }
 
   const rowsHtml = entries.map(renderEntryCard).join('\n')
+  const tokenJson = JSON.stringify(token).replace(/</g, '\\u003c')
 
   return `<!doctype html>
 <html lang="ar" dir="rtl" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>أرشيف التسجيلات — SaveLink</title>
+  <title>أرشيف التسجيلات | SaveLink</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -72,6 +75,11 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       --muted: #94a3b8;
       --accent: #0369a1;
       --accent-hover: #0284c7;
+      --danger-bg: #b91c1c;
+      --danger-hover: #991b1b;
+      --danger-border: #f87171;
+      --err-text: #fca5a5;
+      --ok-text: #86efac;
       --link: #38bdf8;
       --cb-bg: #991b1b;
       --tt-bg: #0f766e;
@@ -88,6 +96,11 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       --muted: #475569;
       --accent: #0369a1;
       --accent-hover: #0284c7;
+      --danger-bg: #b91c1c;
+      --danger-hover: #991b1b;
+      --danger-border: #991b1b;
+      --err-text: #991b1b;
+      --ok-text: #166534;
       --link: #0369a1;
       --cb-bg: #991b1b;
       --tt-bg: #0f766e;
@@ -231,7 +244,7 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
     @media (min-width: 64rem) {
       .table-head {
         display: grid;
-        grid-template-columns: 1.5fr 0.7fr 0.7fr 1.25fr 1.25fr;
+        grid-template-columns: 1.4fr 0.65fr 0.65fr 1.15fr 1.6fr;
         gap: 0.75rem;
         padding: 0.65rem 1rem;
         background: var(--surface-alt);
@@ -247,7 +260,7 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       }
       .archive-item {
         display: grid;
-        grid-template-columns: 1.5fr 0.7fr 0.7fr 1.25fr 1.25fr;
+        grid-template-columns: 1.4fr 0.65fr 0.65fr 1.15fr 1.6fr;
         align-items: center;
         gap: 0.75rem;
         border-radius: 0;
@@ -275,6 +288,10 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       cursor: pointer;
       border: 1px solid transparent;
     }
+    .btn:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
     .btn-primary {
       background: var(--accent);
       color: #ffffff;
@@ -285,6 +302,25 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       border-color: var(--border);
       color: var(--text);
     }
+    .btn-danger {
+      background: var(--danger-bg);
+      border-color: var(--danger-border);
+      color: #ffffff;
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: var(--danger-hover);
+    }
+    .status-banner {
+      margin: 0 0 0.75rem;
+      padding: 0.65rem 0.9rem;
+      border-radius: 0.5rem;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .status-banner.err { color: var(--err-text); border-color: var(--danger-border); }
+    .status-banner.ok { color: var(--ok-text); }
     .empty-box {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -305,7 +341,7 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
     <header class="topbar">
       <div>
         <h1>أرشيف روابط التسجيل</h1>
-        <p class="subtitle tabular">الإجمالي المحفوظ: <strong id="visibleCount">${entries.length}</strong> / ${entries.length} تسجيلاً</p>
+        <p class="subtitle tabular">الإجمالي المحفوظ: <strong id="visibleCount">${entries.length}</strong> / <span id="totalCount">${entries.length}</span> تسجيلاً</p>
       </div>
       <button type="button" id="themeToggle" class="theme-btn">تبديل المظهر</button>
     </header>
@@ -319,6 +355,8 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
         <button type="button" class="filter-btn tabular" data-filter="stripchat" aria-pressed="false">Stripchat (${counts.stripchat})</button>
       </div>
     </section>
+
+    <div id="statusBanner" class="status-banner hidden" role="status" aria-live="polite"></div>
 
     <div class="table-head" aria-hidden="true">
       <span>الحساب والمنصة</span>
@@ -339,6 +377,7 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
 
   <script>
     (function () {
+      var PAGE_TOKEN = ${tokenJson};
       var root = document.documentElement;
       var savedTheme = localStorage.getItem('savelink_archive_theme');
       if (savedTheme === 'light' || savedTheme === 'dark') root.setAttribute('data-theme', savedTheme);
@@ -360,7 +399,30 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       var items = Array.prototype.slice.call(document.querySelectorAll('.archive-item'));
       var filterBtns = Array.prototype.slice.call(document.querySelectorAll('.filter-btn'));
       var visibleCount = document.getElementById('visibleCount');
+      var totalCount = document.getElementById('totalCount');
       var emptyBox = document.getElementById('emptyBox');
+      var statusBanner = document.getElementById('statusBanner');
+
+      function showStatus(msg, isError) {
+        if (!statusBanner) return;
+        statusBanner.textContent = msg;
+        statusBanner.classList.remove('hidden', 'err', 'ok');
+        statusBanner.classList.add(isError ? 'err' : 'ok');
+      }
+
+      function syncFilterCounts() {
+        var counts = { all: items.length, chaturbate: 0, tiktok: 0, stripchat: 0 };
+        items.forEach(function (el) {
+          var plat = el.getAttribute('data-platform') || '';
+          if (Object.prototype.hasOwnProperty.call(counts, plat)) counts[plat]++;
+        });
+        if (totalCount) totalCount.textContent = String(items.length);
+        var labels = { all: 'الكل', chaturbate: 'Chaturbate', tiktok: 'TikTok', stripchat: 'Stripchat' };
+        filterBtns.forEach(function (btn) {
+          var key = btn.getAttribute('data-filter') || 'all';
+          if (labels[key]) btn.textContent = labels[key] + ' (' + (counts[key] || 0) + ')';
+        });
+      }
 
       function applyFilters() {
         var needle = (searchInput.value || '').trim().toLowerCase();
@@ -390,15 +452,51 @@ function renderArchiveHtml(entries: ArchiveEntry[]): string {
       });
 
       document.addEventListener('click', function (ev) {
-        var btn = ev.target && ev.target.closest ? ev.target.closest('.copy-btn') : null;
-        if (!btn) return;
-        var url = btn.getAttribute('data-url') || '';
-        if (!url || !navigator.clipboard) return;
-        navigator.clipboard.writeText(url).then(function () {
-          var prev = btn.textContent;
-          btn.textContent = 'تم النسخ';
-          setTimeout(function () { btn.textContent = prev; }, 1500);
-        }).catch(function () {});
+        var copyBtn = ev.target && ev.target.closest ? ev.target.closest('.copy-btn') : null;
+        if (copyBtn) {
+          var url = copyBtn.getAttribute('data-url') || '';
+          if (!url || !navigator.clipboard) return;
+          navigator.clipboard.writeText(url).then(function () {
+            var prev = copyBtn.textContent;
+            copyBtn.textContent = 'تم النسخ';
+            setTimeout(function () { copyBtn.textContent = prev; }, 1500);
+          }).catch(function () {});
+          return;
+        }
+
+        var delBtn = ev.target && ev.target.closest ? ev.target.closest('.delete-btn') : null;
+        if (!delBtn) return;
+        var entryId = delBtn.getAttribute('data-id') || '';
+        if (!entryId || delBtn.disabled) return;
+        delBtn.disabled = true;
+        delBtn.textContent = 'جاري الحذف...';
+        var endpoint = window.location.pathname.replace(new RegExp('/+$'), '') + '/delete';
+        fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: PAGE_TOKEN, id: entryId })
+        }).then(function (resp) {
+          return resp.json().then(function (data) {
+            return { ok: resp.ok, data: data };
+          });
+        }).then(function (res) {
+          if (!res.ok || !res.data || !res.data.ok) {
+            throw new Error('request_failed');
+          }
+          var card = delBtn.closest('.archive-item');
+          if (card) {
+            var idx = items.indexOf(card);
+            if (idx !== -1) items.splice(idx, 1);
+            card.remove();
+          }
+          syncFilterCounts();
+          applyFilters();
+          showStatus('تم حذف الرابط من الأرشيف.', false);
+        }).catch(function () {
+          delBtn.disabled = false;
+          delBtn.textContent = 'حذف';
+          showStatus('تعذر حذف الرابط. أعد فتح الأرشيف من تيليجرام وحاول مجدداً.', true);
+        });
       });
     })();
   </script>
@@ -418,5 +516,22 @@ archivePageRoute.get('/', async (c) => {
 
   const store = getStore(c.env)
   const entries = await listArchiveEntries(store, verified.chatId)
-  return c.html(renderArchiveHtml(entries))
+  return c.html(renderArchiveHtml(entries, token))
+})
+
+archivePageRoute.post('/delete', async (c) => {
+  const body: any = await c.req.json().catch(() => ({}))
+  const token = String(body.token || c.req.query('t') || '')
+  const verified = await verifyArchivePageToken(token, c.env)
+  if (!verified) {
+    return c.json({ ok: false, error: 'unauthorized' }, 401)
+  }
+
+  const id = String(body.id || '').trim()
+  if (!id) {
+    return c.json({ ok: false, error: 'id required' }, 400)
+  }
+
+  const deleted = await deleteArchiveEntry(getStore(c.env), verified.chatId, id)
+  return c.json({ ok: true, deleted })
 })

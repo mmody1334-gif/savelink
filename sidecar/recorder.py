@@ -7,6 +7,7 @@ and sends the download link directly to the user's Telegram chat.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -32,6 +33,10 @@ MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./recordings_data"))
 RECORDINGS_DIR = MEDIA_DIR / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Leave 40m buffer before GitHub Actions 6h kill and cap size so FastStart fits inside 14 GB disk.
+MAX_RECORD_SECONDS = int(os.getenv("MAX_RECORD_SECONDS", str(5 * 3600 + 20 * 60)))
+MAX_RECORD_BYTES = int(os.getenv("MAX_RECORD_BYTES", str(int(5.5 * 1024 * 1024 * 1024))))
+
 # Active recording jobs: identifier -> RecordingJob
 active_jobs: Dict[str, "RecordingJob"] = {}
 jobs_lock = threading.Lock()
@@ -45,6 +50,15 @@ CB_IMPERSONATE_TARGETS = [
     "edge101",
     "chrome120",
 ]
+
+
+def _ytdlp_impersonate_args(target: str = "chrome") -> list[str]:
+    """Returns --impersonate flags when curl_cffi is available to bypass Cloudflare TLS checks."""
+    try:
+        import curl_cffi  # noqa: F401
+        return ["--impersonate", target]
+    except ImportError:
+        return []
 
 
 def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
@@ -103,7 +117,37 @@ def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
                 logger.debug(f"Chaturbate resolve attempt ({tld}/{imp}) error: {e}")
                 continue
 
-    # Fallback resolver: yt-dlp native extraction
+    # Fallback resolver 1: yt-dlp CLI with browser TLS impersonation
+    try:
+        cmd = [
+            sys.executable,
+            "-m", "yt_dlp",
+            *_ytdlp_impersonate_args("chrome"),
+            "--no-warnings",
+            "-g",
+            f"https://chaturbate.com/{model}/",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        urls = [u.strip() for u in (res.stdout or "").splitlines() if u.strip().startswith("http")]
+        if res.returncode == 0 and urls:
+            return {
+                "ok": True,
+                "room_status": "public",
+                "video_url": urls[0],
+                "audio_url": None,
+                "tld": "com",
+            }
+        err_msg = (res.stderr or "").lower()
+        if "offline" in err_msg:
+            return {"ok": False, "room_status": "offline"}
+        if "private" in err_msg:
+            return {"ok": False, "room_status": "private"}
+        if "away" in err_msg:
+            return {"ok": False, "room_status": "away"}
+    except Exception as e:
+        logger.debug(f"Chaturbate yt-dlp impersonate resolve error: {e}")
+
+    # Fallback resolver 2: yt-dlp native in-process extraction
     try:
         from yt_dlp import YoutubeDL
         ydl = YoutubeDL({"quiet": True, "no_warnings": True})
@@ -420,6 +464,14 @@ def ensure_faststart_streaming(file_path: Path) -> Path:
     """Remuxes MP4 with faststart so moov atom is at beginning for instant web player streaming."""
     if not file_path.exists() or file_path.stat().st_size < 50 * 1024:
         return file_path
+    try:
+        file_size = file_path.stat().st_size
+        free_bytes = shutil.disk_usage(file_path.parent).free
+        if free_bytes < int(file_size * 1.15):
+            logger.warning(f"Skipping faststart optimization due to low disk space ({free_bytes} bytes free for {file_size} bytes)")
+            return file_path
+    except Exception:
+        pass
     fast_tmp = file_path.with_name(f"fast_{file_path.name}")
     cmd = [
         "ffmpeg",
@@ -473,22 +525,61 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
     return None
 
 
-def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
-    """Uploads file to Pixeldrain (supports up to 10GB per file)."""
+def upload_to_pixeldrain(file_path: Path, api_key: str = "") -> Optional[str]:
+    """Uploads file to Pixeldrain with Basic auth (supports up to 10GB per file)."""
+    key = (api_key or os.getenv("PIXELDRAIN_API_KEY", "")).strip()
+    if not key:
+        logger.info("PIXELDRAIN_API_KEY not configured; skipping Pixeldrain and falling back to Gofile.")
+        return None
+
+    base = os.getenv("PIXELDRAIN_API_BASE", "https://pixeldrain.com").rstrip("/")
+    b64 = base64.b64encode(f":{key}".encode("utf-8")).decode("ascii")
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"
+    url = f"{base}/api/file/{urllib.parse.quote(file_path.name)}"
+
     try:
-        filename = file_path.name
-        url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
-        req = urllib.request.Request(
-            url,
-            method="PUT",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"},
-        )
-        with open(file_path, "rb") as f:
-            with urllib.request.urlopen(req, data=f, timeout=600) as resp:
-                data = json.loads(resp.read().decode())
-                file_id = data.get("id")
-                if file_id:
-                    return f"https://pixeldrain.com/u/{file_id}"
+        status = 0
+        raw_body = ""
+        curl_bin = shutil.which("curl")
+        if curl_bin:
+            curl_cmd = [
+                curl_bin,
+                "-sS",
+                "-X", "PUT",
+                "-w", "\n%{http_code}",
+                "-H", f"Authorization: Basic {b64}",
+                "-H", f"User-Agent: {user_agent}",
+                "--upload-file", str(file_path),
+                url,
+            ]
+            res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
+            if res.returncode != 0:
+                logger.error(f"Failed to upload to Pixeldrain via curl (exit {res.returncode})")
+                return None
+            out = res.stdout.rstrip("\r\n")
+            if "\n" in out:
+                raw_body, code_str = out.rsplit("\n", 1)
+                status = int(code_str) if code_str.strip().isdigit() else 0
+            else:
+                raw_body = out
+        else:
+            import requests
+            with open(file_path, "rb") as f:
+                resp = requests.put(
+                    url,
+                    data=f,
+                    headers={"Authorization": f"Basic {b64}", "User-Agent": user_agent},
+                    timeout=600,
+                )
+            status = resp.status_code
+            raw_body = resp.text
+
+        data = json.loads(raw_body) if raw_body.strip().startswith("{") else {}
+        file_id = data.get("id")
+        if 200 <= status < 300 and file_id and data.get("success", True) is not False:
+            return f"https://pixeldrain.com/u/{file_id}"
+        err_detail = data.get("message") or data.get("value") or f"HTTP {status or 'unknown'}"
+        logger.error(f"Failed to upload to Pixeldrain: {err_detail}")
     except Exception as e:
         logger.error(f"Failed to upload to Pixeldrain: {e}")
     return None
@@ -564,6 +655,7 @@ def save_to_worker_archive(
     size_str: str = "",
     duration_str: str = "",
     source: str = "recorder",
+    continuing: bool = False,
 ) -> bool:
     """Persists uploaded recording URL to Worker KV archive so /archive always has it."""
     if not download_url or not chat_id or str(chat_id) == "0":
@@ -578,6 +670,7 @@ def save_to_worker_archive(
         "size": size_str,
         "duration": duration_str,
         "source": source,
+        "continuing": continuing,
     }
     headers = {**_recorder_headers(bot_token), "Content-Type": "application/json"}
     body = json.dumps(payload).encode("utf-8")
@@ -592,6 +685,38 @@ def save_to_worker_archive(
             logger.warning(f"Archive save attempt {attempt + 1} failed for {model}: {e}")
             if attempt < 2:
                 time.sleep(1.5 * (attempt + 1))
+    return False
+
+
+def request_worker_continuation(
+    bot_token: str,
+    chat_id: int | str,
+    platform: str,
+    identifier: str,
+    target_url: str,
+) -> bool:
+    """Asks Worker to dispatch Part 2 when an active stream hits duration/size auto-split limit."""
+    if not chat_id or str(chat_id) == "0":
+        return False
+    worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
+    chat_val: int | str = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+    payload = {
+        "chatId": chat_val,
+        "platform": platform or "universal",
+        "model": identifier,
+        "target": target_url,
+    }
+    headers = {**_recorder_headers(bot_token), "Content-Type": "application/json"}
+    body = json.dumps(payload).encode("utf-8")
+    try:
+        req = urllib.request.Request(f"{worker_base}/api/record/continue", headers=headers, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            continued = bool(data.get("continued"))
+            logger.info(f"Continuation response for {identifier}: continued={continued}")
+            return continued
+    except Exception as e:
+        logger.warning(f"Failed requesting continuation for {identifier}: {e}")
     return False
 
 
@@ -641,6 +766,8 @@ class RecordingJob:
         self.bot_token = bot_token
         self.watch_mode = watch_mode
         self.start_time = time.time()
+        self.job_created_at = self.start_time
+        self.auto_split_triggered = False
         self.stop_requested = False
         self._stop_lock = threading.Lock()
         self.process: Optional[subprocess.Popen] = None
@@ -677,10 +804,33 @@ class RecordingJob:
                 except Exception:
                     pass
             # Poll every 60s to minimize Cloudflare KV reads during long recordings.
-            for _ in range(60):
+            for tick in range(60):
                 if self.stop_requested or (self.process is not None and self.process.poll() is not None):
                     return
+                if tick % 5 == 4 and self._check_auto_split():
+                    return
                 time.sleep(1)
+
+    def _check_auto_split(self) -> bool:
+        """Stops active capture cleanly before 6h kill or disk/host size caps."""
+        if self.stop_requested or self.auto_split_triggered:
+            return False
+        part_path = Path(f"{self.output_path}.part")
+        cur_bytes = self.output_path.stat().st_size if self.output_path.exists() else 0
+        if part_path.exists():
+            cur_bytes = max(cur_bytes, part_path.stat().st_size)
+
+        elapsed = time.time() - self.job_created_at
+        hit_size = cur_bytes >= MAX_RECORD_BYTES
+        hit_time = elapsed >= MAX_RECORD_SECONDS and cur_bytes > 10 * 1024
+        if not hit_size and not hit_time:
+            return False
+
+        reason = f"size={cur_bytes}B" if hit_size else f"elapsed={int(elapsed)}s"
+        logger.info(f"Auto-split threshold reached for {self.identifier} ({reason}); finalising part...")
+        self.auto_split_triggered = True
+        self.stop()
+        return True
 
     def stop(self):
         self.stop_requested = True
@@ -778,7 +928,16 @@ class RecordingJob:
                         self.process.kill()
                     return -1
 
-            return self.process.wait()
+            while True:
+                if self.stop_requested:
+                    self.stop()
+                    return self.process.wait()
+                ret = self.process.poll()
+                if ret is not None:
+                    return ret
+                if self._check_auto_split():
+                    return self.process.wait()
+                time.sleep(2)
         except Exception as e:
             self.error = str(e)
             logger.error(f"Recording process execution error: {e}")
@@ -865,10 +1024,56 @@ class RecordingJob:
                             break
 
             cb_target_url = f"https://chaturbate.com/{self.identifier}/"
+            can_record_cb = not self.stop_requested and (info.get("ok") or cb_room_status in ("public", "unknown", ""))
 
-            # Engine 1: ffmpeg direct master HLS recording (supports instant graceful stop via 'q' & flushes every frame)
-            if info.get("ok") and info.get("video_url") and not self.stop_requested:
-                logger.info(f"Starting Chaturbate recording via ffmpeg for {self.identifier}...")
+            # Engine 1: yt-dlp native with TLS impersonation starts in <1s and bypasses 403
+            if can_record_cb:
+                logger.info(f"Starting Chaturbate recording via yt-dlp for {self.identifier}...")
+                ytdlp_cmd = [
+                    sys.executable,
+                    "-m", "yt_dlp",
+                    *_ytdlp_impersonate_args("chrome"),
+                    "--no-part",
+                    "--no-warnings",
+                    "--fixup", "never",
+                    "--retries", "10",
+                    "--fragment-retries", "10",
+                    "--retry-sleep", "2",
+                    "-o", str(self.output_path),
+                    cb_target_url,
+                ]
+                self._run_with_watchdog(ytdlp_cmd, log_path, startup_timeout=35)
+
+            # Engine 1b: Safari TLS fallback when Chrome impersonation encounters 403
+            if can_record_cb and not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
+                log_tail_check = ""
+                if log_path.exists():
+                    try:
+                        log_tail_check = log_path.read_text(encoding="utf-8", errors="ignore")[-1500:].lower()
+                    except Exception:
+                        pass
+                if "403" in log_tail_check or "forbidden" in log_tail_check:
+                    safari_args = _ytdlp_impersonate_args("safari")
+                    if safari_args:
+                        logger.info(f"Retrying Chaturbate yt-dlp with safari impersonation for {self.identifier}...")
+                        ytdlp_safari = [
+                            sys.executable,
+                            "-m", "yt_dlp",
+                            *safari_args,
+                            "--no-part",
+                            "--no-warnings",
+                            "--fixup", "never",
+                            "--retries", "10",
+                            "--fragment-retries", "10",
+                            "--retry-sleep", "2",
+                            "-o", str(self.output_path),
+                            cb_target_url,
+                        ]
+                        self._run_with_watchdog(ytdlp_safari, log_path, startup_timeout=35)
+
+            # Engine 2: ffmpeg direct master HLS fallback if yt-dlp produced no file
+            if can_record_cb and info.get("ok") and info.get("video_url") and not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
+                logger.info(f"yt-dlp produced no file; trying direct ffmpeg HLS fallback for {self.identifier}...")
                 tld = info.get("tld", "com")
                 ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
                 hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
@@ -892,25 +1097,8 @@ class RecordingJob:
                 ]
                 self._run_with_watchdog(cmd, log_path, startup_timeout=35)
 
-            # Engine 2: yt-dlp native fallback if ffmpeg failed or produced no file (only if stop was not requested)
-            if not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
-                logger.info(f"ffmpeg produced no file; falling back to yt-dlp native for {self.identifier}...")
-                ytdlp_cmd = [
-                    sys.executable,
-                    "-m", "yt_dlp",
-                    "--no-part",
-                    "--no-warnings",
-                    "--fixup", "never",
-                    "--retries", "10",
-                    "--fragment-retries", "10",
-                    "--retry-sleep", "2",
-                    "-o", str(self.output_path),
-                    cb_target_url,
-                ]
-                self._run_with_watchdog(ytdlp_cmd, log_path, startup_timeout=35)
-
-            # Engine 3: streamlink direct fallback (only if stop was not requested)
-            if not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
+            # Engine 3: streamlink direct fallback
+            if can_record_cb and not self.stop_requested and (not self.output_path.exists() or self.output_path.stat().st_size < 10 * 1024):
                 try:
                     logger.info(f"yt-dlp produced no file; trying streamlink fallback for {self.identifier}...")
                     sl_record_cmd = [
@@ -995,6 +1183,7 @@ class RecordingJob:
                     ytdlp_cmd = [
                         sys.executable,
                         "-m", "yt_dlp",
+                        *_ytdlp_impersonate_args("chrome"),
                         "-g",
                         "--no-warnings",
                         "--no-playlist",
@@ -1107,6 +1296,7 @@ class RecordingJob:
                     sys.executable,
                     "-m",
                     "yt_dlp",
+                    *_ytdlp_impersonate_args("chrome"),
                     "--no-part",
                     "--no-warnings",
                     "--retries", "infinite",
@@ -1133,16 +1323,6 @@ class RecordingJob:
                 except Exception as e:
                     logger.warning(f"streamlink direct recording error: {e}")
 
-        # Clear stop signal and watch locks in worker so future recordings are unaffected
-        try:
-            worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
-            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}&platform={urllib.parse.quote(self.platform)}"
-            req = urllib.request.Request(clear_url, headers=_recorder_headers(self.bot_token))
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
-        except Exception:
-            pass
-
         # Job completed or stopped
         with jobs_lock:
             if self.identifier in active_jobs:
@@ -1161,7 +1341,18 @@ class RecordingJob:
         file_exists = self.output_path.exists() and self.output_path.stat().st_size > 10 * 1024
         platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else ("Stripchat" if self.platform == "stripchat" else "Live"))
 
+        def _clear_worker_signal():
+            try:
+                worker_base = os.getenv("WORKER_URL", "https://savelink.hudhaifa-bio.workers.dev").rstrip("/")
+                clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}&platform={urllib.parse.quote(self.platform)}"
+                req = urllib.request.Request(clear_url, headers=_recorder_headers(self.bot_token))
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    resp.read()
+            except Exception:
+                pass
+
         if not file_exists:
+            _clear_worker_signal()
             log_tail = ""
             if log_path.exists():
                 try:
@@ -1228,14 +1419,31 @@ class RecordingJob:
                 size_str,
                 duration_str,
                 "recorder",
+                continuing=self.auto_split_triggered,
             )
+
+        continued = False
+        if self.auto_split_triggered:
+            continued = request_worker_continuation(
+                self.bot_token,
+                self.chat_id,
+                self.platform,
+                self.identifier,
+                self.stream_url,
+            )
+        if not continued:
+            _clear_worker_signal()
+
+        cont_note = "\n🔄 <i>وصل البث للحد الآمن للجزء الحالي، تم حفظ هذا الجزء وبدأ استكمال التسجيل تلقائياً في جزء جديد.</i>" if continued else ""
+
+        if download_url:
             msg = (
                 f"✅ <b>تم اكتمال تسجيل بث {platform_name} بنجاح!</b>\n\n"
                 f"👤 <b>الحساب:</b> <code>{self.identifier}</code>\n"
                 f"⏱️ <b>المدة:</b> {duration_str}\n"
                 f"📦 <b>الحجم:</b> {size_str}\n"
                 f"🔗 <b>الرابط المباشر للمشاهدة والتحميل السريع:</b>\n{download_url}\n"
-                f"🗄️ <i>تم حفظ الرابط تلقائياً في /archive</i>"
+                f"🗄️ <i>تم حفظ الرابط تلقائياً في /archive</i>{cont_note}"
             )
         else:
             msg = (
@@ -1243,7 +1451,7 @@ class RecordingJob:
                 f"👤 <b>الحساب:</b> <code>{self.identifier}</code>\n"
                 f"⏱️ <b>المدة:</b> {duration_str}\n"
                 f"📦 <b>الحجم:</b> {size_str}\n"
-                f"📁 <b>اسم الملف:</b> <code>{self.filename}</code>"
+                f"📁 <b>اسم الملف:</b> <code>{self.filename}</code>{cont_note}"
             )
 
         uploaded_direct = False

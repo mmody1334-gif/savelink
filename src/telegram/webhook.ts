@@ -1,6 +1,20 @@
 import type { Context } from 'hono'
 import { maxUploadBytes, profileMaxItems, publicBase, rateLimitPerMin } from '../config'
-import { listArchiveEntries, signArchivePageUrl, type ArchiveEntry } from '../archive'
+import {
+  clearArchiveEntries,
+  deleteArchiveEntry,
+  listArchiveEntries,
+  signArchivePageUrl,
+  type ArchiveEntry,
+} from '../archive'
+import {
+  clearAllActiveRecordings,
+  getActiveRecording,
+  listActiveRecordings,
+  markRecordingStarted,
+  normalizeRecPlatform,
+  type ActiveRecording,
+} from '../active-recordings'
 import { ResolveError, errorMessage } from '../errors'
 import { signFileUrl } from '../files'
 import { resolveInstagramProfile, fetchArchivePage, type InstagramProfileResult } from '../instagram-profile'
@@ -75,6 +89,7 @@ import {
 import {
   WATCH_CHECK_INTERVAL_MINUTES,
   addWatchTarget,
+  clearAllWatchLocksForTarget,
   removeWatchTarget,
   listUserWatchTargets,
   triggerWatchTargetIfLive,
@@ -660,6 +675,11 @@ async function handleCommand(
     }
     case 'stop': {
       await handleStopCommand(tg, message, rest, lang, env, store, origin)
+      return
+    }
+    case 'status':
+    case 'active': {
+      await handleStatusCommand(tg, message, lang, env, store)
       return
     }
     case 'stop_recorder': {
@@ -2762,24 +2782,159 @@ export async function cancelGitHubRecorder(
   return { ok: true, count: runs.length }
 }
 
+async function getGitHubRecorderRuns(
+  env: Env,
+): Promise<{ ok: boolean; activeCount: number; queuedCount: number }> {
+  const token = env.GITHUB_TOKEN
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  if (!token) return { ok: false, activeCount: 0, queuedCount: 0 }
+
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/record.yml/runs?per_page=25`, {
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: 'application/vnd.github.v3+json',
+        'User-Agent': 'SaveLink-Telegram-Bot',
+      },
+      signal: AbortSignal.timeout(8_000),
+    })
+    if (!res.ok) return { ok: false, activeCount: 0, queuedCount: 0 }
+    const data: any = await res.json()
+    let activeCount = 0
+    let queuedCount = 0
+    for (const run of data.workflow_runs || []) {
+      if (run.status === 'in_progress') activeCount += 1
+      else if (run.status === 'queued' || run.status === 'waiting' || run.status === 'pending') queuedCount += 1
+    }
+    return { ok: true, activeCount, queuedCount }
+  } catch {
+    return { ok: false, activeCount: 0, queuedCount: 0 }
+  }
+}
+
 async function getGitHubRecorderStatus(
   env: Env,
 ): Promise<{ active: boolean; count: number }> {
-  const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
-  if (!token) return { active: false, count: 0 }
+  const gh = await getGitHubRecorderRuns(env)
+  return { active: gh.activeCount > 0, count: gh.activeCount }
+}
 
-  const listRes = await fetch(`https://api.github.com/repos/${repo}/actions/runs?status=in_progress`, {
-    headers: {
-      Authorization: `token ${token}`,
-      Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'SaveLink-Telegram-Bot',
-    },
+function safeCallbackData(prefix: string, raw: string, maxBytes = 64): string {
+  const enc = new TextEncoder()
+  const prefixBytes = enc.encode(prefix).length
+  if (prefixBytes >= maxBytes) return prefix.slice(0, maxBytes)
+  let out = ''
+  for (const ch of raw) {
+    const candidate = out + ch
+    if (prefixBytes + enc.encode(candidate).length > maxBytes) break
+    out = candidate
+  }
+  return prefix + out
+}
+
+function formatRecordingElapsed(startedAt: number, lang: Lang): string {
+  const totalMins = Math.max(0, Math.floor((Date.now() - startedAt) / 60_000))
+  const hours = Math.floor(totalMins / 60)
+  const mins = totalMins % 60
+  if (lang === 'ar') {
+    return hours > 0 ? `${hours} س ${mins} د` : `${mins} د`
+  }
+  return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
+}
+
+function recPlatformBadge(platform: ActiveRecording['platform']): string {
+  if (platform === 'chaturbate') return '🔴 Chaturbate'
+  if (platform === 'tiktok') return '🎵 TikTok'
+  if (platform === 'stripchat') return '🟣 Stripchat'
+  return '🎥 Live'
+}
+
+async function renderRecorderStatusView(
+  lang: Lang,
+  env: Env,
+  store: Store,
+): Promise<{ text: string; reply_markup: InlineKeyboard }> {
+  const paused = await isRecorderPaused(env)
+  let active = await listActiveRecordings(store)
+  const endpoint = env.RECORDER_ENDPOINT || env.YTDLP_ENDPOINT
+  const gh = env.GITHUB_TOKEN && !endpoint ? await getGitHubRecorderRuns(env) : { ok: false, activeCount: 0, queuedCount: 0 }
+
+  // Heal stale tracked locks if GitHub reports zero live or queued runs and none started under 60s ago.
+  if (gh.ok && gh.activeCount === 0 && gh.queuedCount === 0 && active.length > 0) {
+    const newest = Math.max(...active.map((a) => a.startedAt))
+    if (Date.now() - newest > 60_000) {
+      await clearAllActiveRecordings(store)
+      active = []
+    }
+  }
+
+  const stateLine = paused
+    ? (lang === 'ar' ? '⏸️ <b>الحالة العامة:</b> متوقف مؤقتاً (/stop recorder)' : '⏸️ <b>Recorder State:</b> Paused (/stop recorder)')
+    : (lang === 'ar' ? '🟢 <b>الحالة العامة:</b> نشط وجاهز' : '🟢 <b>Recorder State:</b> Active')
+
+  let body = ''
+  if (active.length > 0) {
+    const lines = active.map((rec, i) => {
+      const elapsed = formatRecordingElapsed(rec.startedAt, lang)
+      const srcLabel = rec.source === 'watch'
+        ? (lang === 'ar' ? 'مراقبة تلقائية' : 'watch')
+        : rec.source === 'continuation'
+          ? (lang === 'ar' ? 'جزء مكمل' : 'part')
+          : (lang === 'ar' ? 'يدوي' : 'manual')
+      return `<b>${i + 1}.</b> ${recPlatformBadge(rec.platform)} — <code>${escapeHtml(rec.model)}</code>\n   ⏱️ ${elapsed} • (${srcLabel})`
+    })
+    body = `\n\n${lines.join('\n\n')}`
+    if (gh.ok && gh.activeCount > active.length) {
+      const untracked = gh.activeCount - active.length
+      body += lang === 'ar'
+        ? `\n\nℹ️ <i>+${untracked} مهمة سحابية إضافية جارية على GitHub.</i>`
+        : `\n\nℹ️ <i>+${untracked} additional untracked GitHub run(s) active.</i>`
+    }
+  } else if (gh.ok && (gh.activeCount > 0 || gh.queuedCount > 0)) {
+    body = lang === 'ar'
+      ? `\n\n🔴 توجد <b>${gh.activeCount}</b> مهمة تسجيل جارية و<b>${gh.queuedCount}</b> بالانتظار على GitHub Actions (بدأت قبل تفعيل التتبع التفصيلي).`
+      : `\n\n🔴 <b>${gh.activeCount}</b> active and <b>${gh.queuedCount}</b> queued GitHub run(s) running.`
+  } else {
+    body = lang === 'ar'
+      ? '\n\n📭 لا توجد تسجيلات نشطة حالياً.'
+      : '\n\n📭 No active recordings right now.'
+  }
+
+  const header = lang === 'ar' ? '📊 <b>حالة مسجل البثوث المباشرة</b>' : '📊 <b>Live Stream Recorder Status</b>'
+  const text = `${header}\n\n${stateLine}${body}`
+
+  const rows: InlineKeyboard['inline_keyboard'] = []
+  for (const rec of active.slice(0, 6)) {
+    rows.push([
+      {
+        text: lang === 'ar' ? `⏹️ إيقاف وحفظ: ${rec.model}` : `⏹️ Stop & Save: ${rec.model}`,
+        callback_data: safeCallbackData('rec|stop|', rec.model),
+      },
+    ])
+  }
+  rows.push([
+    { text: lang === 'ar' ? '🔄 تحديث الحالة' : '🔄 Refresh Status', callback_data: 'rec|list' },
+    { text: lang === 'ar' ? '🗄️ الأرشيف' : '🗄️ Archive', callback_data: 'arch|p|0|' },
+  ])
+
+  return { text, reply_markup: { inline_keyboard: rows } }
+}
+
+async function handleStatusCommand(
+  tg: TelegramApi,
+  message: TgMessage,
+  lang: Lang,
+  env: Env,
+  store: Store,
+): Promise<void> {
+  const { text, reply_markup } = await renderRecorderStatusView(lang, env, store)
+  await tg.call('sendMessage', {
+    chat_id: message.chat.id,
+    text,
+    parse_mode: 'HTML',
+    reply_to_message_id: message.message_id,
+    reply_markup,
   })
-  if (!listRes.ok) return { active: false, count: 0 }
-  const data: any = await listRes.json()
-  const runs = data.workflow_runs || []
-  return { active: runs.length > 0, count: runs.length }
 }
 
 /**
@@ -2850,6 +3005,11 @@ async function handleRecordCommand(
   }
 
   let clean = rest.trim()
+  let forceStart = false
+  if (/^force\s+/i.test(clean)) {
+    forceStart = true
+    clean = clean.replace(/^force\s+/i, '').trim()
+  }
   let model = clean
   let platformLabel = 'Live Stream'
   let isSupported = false
@@ -2944,6 +3104,47 @@ async function handleRecordCommand(
     resumedNote = lang === 'ar'
       ? '\n▶️ <i>تم إعادة تفعيل المسجل والمراقبة التلقائية (/watch) تلقائياً.</i>'
       : '\n▶️ <i>Recorder & /watch resumed automatically.</i>'
+  }
+
+  const initialRecPlatform = normalizeRecPlatform(platformLabel)
+  if (!forceStart) {
+    let existing = await getActiveRecording(store, initialRecPlatform, model)
+    if (existing && hasGitHub && !endpoint && Date.now() - existing.startedAt > 90_000) {
+      const gh = await getGitHubRecorderRuns(env)
+      if (gh.ok && gh.activeCount === 0 && gh.queuedCount === 0) {
+        await clearAllActiveRecordings(store)
+        await clearAllWatchLocksForTarget(store, model)
+        existing = null
+      }
+    }
+    if (existing) {
+      const elapsed = formatRecordingElapsed(existing.startedAt, lang)
+      const stopCb = safeCallbackData('rec|stop|', existing.model)
+      const forceCb = safeCallbackData('rec|force|', existing.model)
+      await tg.call('sendMessage', {
+        chat_id: chatId,
+        text: (lang === 'ar'
+          ? `⚠️ <b>الحساب <code>${escapeHtml(existing.model)}</code> قيد التسجيل بالفعل!</b>\n\n` +
+            `• المنصة: ${recPlatformBadge(existing.platform)}\n` +
+            `• بدأ منذ: <b>${elapsed}</b>\n\n` +
+            `لتجنب تكرار المهام، أوقف التسجيل الحالي أولاً أو افتح قائمة التسجيلات النشطة.`
+          : `⚠️ <b><code>${escapeHtml(existing.model)}</code> is already recording!</b>\n\n` +
+            `• Platform: ${recPlatformBadge(existing.platform)}\n` +
+            `• Running for: <b>${elapsed}</b>`) + resumedNote,
+        parse_mode: 'HTML',
+        reply_to_message_id: message.message_id,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: lang === 'ar' ? '⏹️ إيقاف وحفظ التسجيل الحالي' : '⏹️ Stop & Save Current', callback_data: stopCb }],
+            [
+              { text: lang === 'ar' ? '📊 التسجيلات النشطة' : '📊 Active Recordings', callback_data: 'rec|list' },
+              { text: lang === 'ar' ? '🔁 فرض تسجيل جديد' : '🔁 Force New Run', callback_data: forceCb },
+            ],
+          ],
+        },
+      })
+      return
+    }
   }
 
   const cleanStopKey = model.replace(/^@/, '').toLowerCase()
@@ -3095,6 +3296,14 @@ async function handleRecordCommand(
         throw new Error(data.detail || data.error || 'Failed to start recording')
       }
     }
+
+    await markRecordingStarted(store, {
+      platform: normalizeRecPlatform(platformLabel),
+      model,
+      target: clean,
+      chatId,
+      source: 'manual',
+    })
 
     const startMsg = (lang === 'ar'
       ? `🔴 <b>جاري الاتصال وتسجيل بث ${platformLabel} في السحابة!</b>\n\n` +
@@ -3304,12 +3513,40 @@ async function handleRecordCallback(
   _store: Store,
   _origin: string,
 ): Promise<void> {
-  const action = parts[1] // 'stop' | 'stat'
-  const model = parts[2]
+  const action = parts[1] // 'stop' | 'stat' | 'list' | 'force'
+  const model = parts.slice(2).join('|')
+
+  if (action === 'list') {
+    await answer(tg, query?.id, '')
+    const { text, reply_markup } = await renderRecorderStatusView(lang, env, _store)
+    await tg.safeEdit('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      reply_markup,
+    })
+    return
+  }
+
   const hasGitHub = !!env.GITHUB_TOKEN
   const endpoint = env.RECORDER_ENDPOINT || env.YTDLP_ENDPOINT
   if (!hasGitHub && !endpoint) {
     await answer(tg, query?.id, 'Recorder endpoint not configured', true)
+    return
+  }
+
+  if (action === 'force') {
+    await answer(tg, query?.id, lang === 'ar' ? 'جاري بدء تسجيل جديد...' : 'Starting new recording...')
+    const active = await listActiveRecordings(_store)
+    const found = active.find((r) => r.model === model.replace(/^@/, '').toLowerCase())
+    const targetToStart = found?.target || model
+    const syntheticMessage: TgMessage = {
+      message_id: messageId,
+      chat: { id: chatId, type: query?.message?.chat?.type || 'private' },
+      from: query?.from,
+    }
+    await handleRecordCommand(tg, syntheticMessage, `force ${targetToStart}`, lang, env, _store, _origin)
     return
   }
 
@@ -3345,7 +3582,10 @@ async function handleRecordCallback(
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
-            [{ text: lang === 'ar' ? '🗄️ أرشيف التسجيلات' : '🗄️ Recordings Archive', callback_data: 'arch|p|0|' }],
+            [
+              { text: lang === 'ar' ? '🗄️ أرشيف التسجيلات' : '🗄️ Recordings Archive', callback_data: 'arch|p|0|' },
+              { text: lang === 'ar' ? '📊 التسجيلات النشطة' : '📊 Active Status', callback_data: 'rec|list' },
+            ],
           ],
         },
       })
@@ -3358,10 +3598,16 @@ async function handleRecordCallback(
   if (action === 'stat') {
     try {
       if (hasGitHub) {
+        const active = await listActiveRecordings(_store)
+        const tracked = active.find((r) => r.model === model.replace(/^@/, '').toLowerCase())
         const stat = await getGitHubRecorderStatus(env)
-        const text = stat.active
-          ? (lang === 'ar' ? `🔴 مسجل GitHub السحابي نشط حالياً (${stat.count} بث قيد التسجيل)` : `🔴 GitHub Cloud Recorder active (${stat.count} running)`)
-          : (lang === 'ar' ? 'التسجيل انتهى أو تم الرفع' : 'Recording completed or not found')
+        const text = tracked
+          ? (lang === 'ar'
+              ? `🔴 ${tracked.model} قيد التسجيل منذ ${formatRecordingElapsed(tracked.startedAt, lang)} (الإجمالي النشط: ${Math.max(stat.count, active.length)})`
+              : `🔴 ${tracked.model} recording for ${formatRecordingElapsed(tracked.startedAt, lang)} (Active: ${Math.max(stat.count, active.length)})`)
+          : stat.active
+            ? (lang === 'ar' ? `🔴 مسجل GitHub السحابي نشط حالياً (${stat.count} بث قيد التسجيل)` : `🔴 GitHub Cloud Recorder active (${stat.count} running)`)
+            : (lang === 'ar' ? 'التسجيل انتهى أو تم الرفع' : 'Recording completed or not found')
         await answer(tg, query?.id, text, true)
       } else if (endpoint) {
         const base = endpoint.replace(/\/+$/, '')
@@ -3459,26 +3705,53 @@ async function renderRecordingsArchiveMessage(
   }
 
   const rows: InlineKeyboard['inline_keyboard'] = []
+  const filterKey = cleanQuery.toLowerCase()
+  rows.push([
+    { text: (!filterKey ? '• ' : '') + (lang === 'ar' ? 'الكل' : 'All'), callback_data: 'arch|p|0|' },
+    { text: (filterKey === 'chaturbate' ? '• ' : '') + '🔴 CB', callback_data: 'arch|p|0|chaturbate' },
+    { text: (filterKey === 'tiktok' ? '• ' : '') + '🎵 TT', callback_data: 'arch|p|0|tiktok' },
+    { text: (filterKey === 'stripchat' ? '• ' : '') + '🟣 SC', callback_data: 'arch|p|0|stripchat' },
+  ])
+
+  if (slice.length > 0) {
+    const deleteBtns = slice.map((entry, idx) => {
+      const num = safePage * ARCHIVE_PAGE_SIZE + idx + 1
+      return {
+        text: `🗑️ #${num}`,
+        callback_data: safeCallbackData(`arch|d|${entry.id}|${safePage}|`, cleanQuery),
+      }
+    })
+    for (let i = 0; i < deleteBtns.length; i += 3) {
+      rows.push(deleteBtns.slice(i, i + 3))
+    }
+  }
+
   if (totalPages > 1) {
     const navRow: InlineKeyboard['inline_keyboard'][number] = []
     if (safePage > 0) {
       navRow.push({
         text: lang === 'ar' ? '⬅️ السابق' : '⬅️ Prev',
-        callback_data: `arch|p|${safePage - 1}|${cleanQuery}`,
+        callback_data: safeCallbackData(`arch|p|${safePage - 1}|`, cleanQuery),
       })
     }
-    navRow.push({ text: `${safePage + 1}/${totalPages}`, callback_data: `arch|r|${safePage}|${cleanQuery}` })
+    navRow.push({
+      text: `${safePage + 1}/${totalPages}`,
+      callback_data: safeCallbackData(`arch|r|${safePage}|`, cleanQuery),
+    })
     if (safePage < totalPages - 1) {
       navRow.push({
         text: lang === 'ar' ? 'التالي ➡️' : 'Next ➡️',
-        callback_data: `arch|p|${safePage + 1}|${cleanQuery}`,
+        callback_data: safeCallbackData(`arch|p|${safePage + 1}|`, cleanQuery),
       })
     }
     rows.push(navRow)
   }
 
   const actionRow: InlineKeyboard['inline_keyboard'][number] = [
-    { text: lang === 'ar' ? '🔄 تحديث الأرشيف' : '🔄 Refresh Archive', callback_data: `arch|r|${safePage}|${cleanQuery}` },
+    {
+      text: lang === 'ar' ? '🔄 تحديث الأرشيف' : '🔄 Refresh Archive',
+      callback_data: safeCallbackData(`arch|r|${safePage}|`, cleanQuery),
+    },
   ]
   const baseUrl = publicBase(env, origin)
   if (/^https:\/\//i.test(baseUrl)) {
@@ -3502,6 +3775,26 @@ async function handleRecordingsArchiveCommand(
   store: Store,
   origin: string,
 ): Promise<void> {
+  if (rest.trim().toLowerCase() === 'clear') {
+    await tg.call('sendMessage', {
+      chat_id: message.chat.id,
+      text: lang === 'ar'
+        ? '⚠️ <b>هل تريد مسح جميع روابط التسجيلات من أرشيفك؟</b>\nلن يمكن التراجع عن هذا الإجراء.'
+        : '⚠️ <b>Clear every recording link from your archive?</b>\nThis cannot be undone.',
+      parse_mode: 'HTML',
+      reply_to_message_id: message.message_id,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: lang === 'ar' ? '🗑️ نعم، مسح كل الأرشيف' : '🗑️ Yes, clear all', callback_data: 'arch|clr_yes' },
+            { text: lang === 'ar' ? '↩️ إلغاء' : '↩️ Cancel', callback_data: 'arch|p|0|' },
+          ],
+        ],
+      },
+    })
+    return
+  }
+
   const { text, reply_markup } = await renderRecordingsArchiveMessage(store, message.chat.id, 0, rest, lang, env, origin)
   await tg.call('sendMessage', {
     chat_id: message.chat.id,
@@ -3524,9 +3817,35 @@ async function handleRecordingsArchiveCallback(
   store: Store,
   origin: string,
 ): Promise<void> {
-  const page = Number(parts[2] || '0') || 0
-  const filter = parts.slice(3).join('|')
-  await answer(tg, query?.id, '')
+  const action = parts[1]
+  let page = 0
+  let filter = ''
+
+  if (action === 'd') {
+    const entryId = parts[2] || ''
+    page = Number(parts[3] || '0') || 0
+    filter = parts.slice(4).join('|')
+    const removed = await deleteArchiveEntry(store, chatId, entryId)
+    await answer(
+      tg,
+      query?.id,
+      removed
+        ? (lang === 'ar' ? '🗑️ تم حذف الرابط من الأرشيف' : 'Deleted from archive')
+        : (lang === 'ar' ? 'الرابط محذوف مسبقاً' : 'Already deleted'),
+    )
+  } else if (action === 'clr_yes') {
+    const count = await clearArchiveEntries(store, chatId)
+    await answer(
+      tg,
+      query?.id,
+      lang === 'ar' ? `🗑️ تم مسح ${count} رابط من الأرشيف` : `Cleared ${count} links`,
+    )
+  } else {
+    page = Number(parts[2] || '0') || 0
+    filter = parts.slice(3).join('|')
+    await answer(tg, query?.id, '')
+  }
+
   const { text, reply_markup } = await renderRecordingsArchiveMessage(store, chatId, page, filter, lang, env, origin)
   await tg.safeEdit('editMessageText', {
     chat_id: chatId,
@@ -5645,6 +5964,9 @@ function renderMainMenu(lang: Lang): { text: string; reply_markup: InlineKeyboar
       ],
       [
         { text: '🗄️ أرشيف التسجيلات', callback_data: 'arch|p|0|' },
+        { text: '📊 التسجيلات النشطة', callback_data: 'rec|list' },
+      ],
+      [
         { text: '✂️ أدوات الميديا (قص / تحويل)', callback_data: 'menu|tools' },
       ],
     ],

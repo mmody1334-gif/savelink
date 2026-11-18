@@ -6,10 +6,12 @@ uploads directly to Telegram if <= 50MB, and provides a permanent Pixeldrain dow
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -36,22 +38,86 @@ def normalize_video_url(url: str) -> str:
     return clean
 
 
-def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
+def upload_to_pixeldrain(file_path: Path, api_key: str = "") -> Optional[str]:
+    key = (api_key or os.getenv("PIXELDRAIN_API_KEY", "")).strip()
+    if not key:
+        logger.info("PIXELDRAIN_API_KEY not configured; skipping Pixeldrain and falling back to Gofile.")
+        return None
+
+    base = os.getenv("PIXELDRAIN_API_BASE", "https://pixeldrain.com").rstrip("/")
+    b64 = base64.b64encode(f":{key}".encode("utf-8")).decode("ascii")
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-trimmer/1.0"
+    url = f"{base}/api/file/{urllib.parse.quote(file_path.name)}"
+
     try:
-        filename = file_path.name
-        url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
-        req = urllib.request.Request(
-            url,
-            method="PUT",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-trimmer/1.0"},
-        )
-        with open(file_path, "rb") as f:
-            with urllib.request.urlopen(req, data=f, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("success"):
-                    return f"https://pixeldrain.com/u/{data.get('id')}"
+        status = 0
+        raw_body = ""
+        curl_bin = shutil.which("curl")
+        if curl_bin:
+            curl_cmd = [
+                curl_bin,
+                "-sS",
+                "-X", "PUT",
+                "-w", "\n%{http_code}",
+                "-H", f"Authorization: Basic {b64}",
+                "-H", f"User-Agent: {user_agent}",
+                "--upload-file", str(file_path),
+                url,
+            ]
+            res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
+            if res.returncode != 0:
+                logger.error(f"Pixeldrain upload failed via curl (exit {res.returncode})")
+                return None
+            out = res.stdout.rstrip("\r\n")
+            if "\n" in out:
+                raw_body, code_str = out.rsplit("\n", 1)
+                status = int(code_str) if code_str.strip().isdigit() else 0
+            else:
+                raw_body = out
+        else:
+            import requests
+            with open(file_path, "rb") as f:
+                resp = requests.put(
+                    url,
+                    data=f,
+                    headers={"Authorization": f"Basic {b64}", "User-Agent": user_agent},
+                    timeout=600,
+                )
+            status = resp.status_code
+            raw_body = resp.text
+
+        data = json.loads(raw_body) if raw_body.strip().startswith("{") else {}
+        file_id = data.get("id")
+        if 200 <= status < 300 and file_id and data.get("success", True) is not False:
+            return f"https://pixeldrain.com/u/{file_id}"
+        err_detail = data.get("message") or data.get("value") or f"HTTP {status or 'unknown'}"
+        logger.error(f"Pixeldrain upload failed: {err_detail}")
     except Exception as e:
         logger.error(f"Pixeldrain upload failed: {e}")
+    return None
+
+
+def upload_to_gofile(file_path: Path) -> Optional[str]:
+    try:
+        srv_req = urllib.request.Request("https://api.gofile.io/servers", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(srv_req, timeout=15) as resp:
+            srv_data = json.loads(resp.read().decode("utf-8"))
+            server = srv_data.get("data", {}).get("servers", [{}])[0].get("name")
+            if not server:
+                return None
+
+        import requests
+        with open(file_path, "rb") as f:
+            up_resp = requests.post(
+                f"https://{server}.gofile.io/contents/uploadfile",
+                files={"file": (file_path.name, f, "video/mp4")},
+                timeout=600,
+            )
+            up_data = up_resp.json()
+            if up_data.get("status") == "ok":
+                return up_data.get("data", {}).get("downloadPage")
+    except Exception as e:
+        logger.error(f"Gofile upload failed: {e}")
     return None
 
 
@@ -170,7 +236,7 @@ def trim_video(url: str, start: str, end: str, chat_id: int | str, bot_token: st
     size_str = f"{size_mb:.1f} MB" if size_mb < 1024 else f"{(size_mb / 1024):.2f} GB"
 
     logger.info(f"Trim completed: {size_str}, uploading...")
-    download_url = upload_to_pixeldrain(output_path)
+    download_url = upload_to_pixeldrain(output_path) or upload_to_gofile(output_path)
 
     caption = (
         f"✂️ <b>تم قص الفيديو بنجاح!</b>\n\n"

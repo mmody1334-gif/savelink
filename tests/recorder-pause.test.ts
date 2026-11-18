@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import worker from '../src/index'
+import { clearAllActiveRecordings } from '../src/active-recordings'
 import { isRecorderPaused, setRecorderPaused } from '../src/pause'
 import { apiRoute } from '../src/routes/api'
 import { getStore } from '../src/store'
@@ -35,6 +36,7 @@ afterEach(async () => {
   await setRecorderPaused({} as Env, false)
   const store = getStore({} as Env)
   await store.delete('stop:visceratio')
+  await clearAllActiveRecordings(store)
   await removeWatchTarget(736161596, 'visceratio', store)
 })
 

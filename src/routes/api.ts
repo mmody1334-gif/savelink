@@ -11,8 +11,15 @@ import {
 import type { Env } from '../types'
 import { isPaused, isRecorderPaused } from '../pause'
 import {
+  markRecordingFinished,
+  markRecordingStarted,
+  normalizeRecModel,
+  normalizeRecPlatform,
+} from '../active-recordings'
+import {
   parseWatchTarget,
   checkTargetLive,
+  dispatchRecorderWorkflow,
   watchLockKey,
   clearWatchLock,
   clearAllWatchLocksForTarget,
@@ -134,6 +141,7 @@ apiRoute.get('/record/signal/clear', async (c) => {
     } else {
       await clearAllWatchLocksForTarget(store, target)
     }
+    await markRecordingFinished(store, target, platform || undefined)
   }
   return c.json({ ok: true })
 })
@@ -148,6 +156,54 @@ apiRoute.post('/record/stop', async (c) => {
   await store.put(`stop:${target}`, '1', 3600)
   invalidateSignalMemo(target)
   return c.json({ ok: true, message: 'Stop signal sent' })
+})
+
+apiRoute.post('/record/continue', async (c) => {
+  const denied = await requireRecorderAuth(c)
+  if (denied) return denied
+  const body: any = await c.req.json().catch(() => ({}))
+  const chatId = Number(body.chatId)
+  const cleanModel = normalizeRecModel(String(body.model || ''))
+  const platform = normalizeRecPlatform(String(body.platform || 'universal'))
+  if (!cleanModel || !Number.isFinite(chatId) || chatId === 0) {
+    return c.json({ ok: false, continued: false, error: 'chatId and model are required' }, 400)
+  }
+
+  const store = getStore(c.env)
+  const trimmedModel = cleanModel.replace(/^_+|_+$/g, '')
+  const stopFlag = Boolean(await store.get(`stop:${cleanModel}`)) || (trimmedModel ? Boolean(await store.get(`stop:${trimmedModel}`)) : false)
+  if ((await isRecorderPaused(c.env)) || stopFlag) {
+    await clearAllWatchLocksForTarget(store, cleanModel)
+    await markRecordingFinished(store, cleanModel, platform)
+    return c.json({ ok: true, continued: false, reason: 'stopped' })
+  }
+
+  if (!c.env.GITHUB_TOKEN) {
+    return c.json({ ok: false, continued: false, error: 'no_github_token' }, 503)
+  }
+
+  const rawTarget = String(body.target || '').trim()
+  const dispatchTarget =
+    rawTarget ||
+    (platform === 'tiktok'
+      ? `@${cleanModel}`
+      : platform === 'stripchat'
+        ? `https://stripchat.com/${cleanModel}`
+        : cleanModel)
+
+  const dispatch = await dispatchRecorderWorkflow(c.env, dispatchTarget, chatId, '0')
+  if (!dispatch.ok) {
+    return c.json({ ok: false, continued: false, error: `dispatch_failed_${dispatch.status}` }, 502)
+  }
+
+  await markRecordingStarted(store, {
+    platform,
+    model: cleanModel,
+    target: dispatchTarget,
+    chatId,
+    source: 'continuation',
+  })
+  return c.json({ ok: true, continued: true })
 })
 
 apiRoute.post('/archive/add', async (c) => {
@@ -171,6 +227,9 @@ apiRoute.post('/archive/add', async (c) => {
     source: body.source === 'uploader' || body.source === 'backfill' ? body.source : 'recorder',
     createdAt: typeof body.createdAt === 'number' ? body.createdAt : undefined,
   })
+  if (body.source !== 'backfill' && !body.continuing) {
+    await markRecordingFinished(store, model, body.platform ? String(body.platform) : undefined)
+  }
   return c.json({ ok: true, entry })
 })
 

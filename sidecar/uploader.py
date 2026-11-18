@@ -6,11 +6,13 @@ is uploaded to Pixeldrain/Gofile and delivered to Telegram.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +33,14 @@ def ensure_faststart_streaming(file_path: Path) -> Path:
     """Remuxes MP4 with faststart so moov atom is at beginning for instant web player streaming."""
     if not file_path.exists() or file_path.stat().st_size < 50 * 1024:
         return file_path
+    try:
+        file_size = file_path.stat().st_size
+        free_bytes = shutil.disk_usage(file_path.parent).free
+        if free_bytes < int(file_size * 1.15):
+            logger.warning(f"Skipping faststart optimization due to low disk space ({free_bytes} bytes free for {file_size} bytes)")
+            return file_path
+    except Exception:
+        pass
     fast_tmp = file_path.with_name(f"fast_{file_path.name}")
     cmd = [
         "ffmpeg",
@@ -53,20 +63,60 @@ def ensure_faststart_streaming(file_path: Path) -> Path:
     return file_path
 
 
-def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
+def upload_to_pixeldrain(file_path: Path, api_key: str = "") -> Optional[str]:
+    key = (api_key or os.getenv("PIXELDRAIN_API_KEY", "")).strip()
+    if not key:
+        logger.info("PIXELDRAIN_API_KEY not configured; skipping Pixeldrain and falling back to Gofile.")
+        return None
+
+    base = os.getenv("PIXELDRAIN_API_BASE", "https://pixeldrain.com").rstrip("/")
+    b64 = base64.b64encode(f":{key}".encode("utf-8")).decode("ascii")
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"
+    url = f"{base}/api/file/{urllib.parse.quote(file_path.name)}"
+
     try:
-        filename = file_path.name
-        url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
-        req = urllib.request.Request(
-            url,
-            method="PUT",
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"},
-        )
-        with open(file_path, "rb") as f:
-            with urllib.request.urlopen(req, data=f, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("success"):
-                    return f"https://pixeldrain.com/u/{data.get('id')}"
+        status = 0
+        raw_body = ""
+        curl_bin = shutil.which("curl")
+        if curl_bin:
+            curl_cmd = [
+                curl_bin,
+                "-sS",
+                "-X", "PUT",
+                "-w", "\n%{http_code}",
+                "-H", f"Authorization: Basic {b64}",
+                "-H", f"User-Agent: {user_agent}",
+                "--upload-file", str(file_path),
+                url,
+            ]
+            res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
+            if res.returncode != 0:
+                logger.error(f"Pixeldrain upload failed via curl (exit {res.returncode})")
+                return None
+            out = res.stdout.rstrip("\r\n")
+            if "\n" in out:
+                raw_body, code_str = out.rsplit("\n", 1)
+                status = int(code_str) if code_str.strip().isdigit() else 0
+            else:
+                raw_body = out
+        else:
+            import requests
+            with open(file_path, "rb") as f:
+                resp = requests.put(
+                    url,
+                    data=f,
+                    headers={"Authorization": f"Basic {b64}", "User-Agent": user_agent},
+                    timeout=600,
+                )
+            status = resp.status_code
+            raw_body = resp.text
+
+        data = json.loads(raw_body) if raw_body.strip().startswith("{") else {}
+        file_id = data.get("id")
+        if 200 <= status < 300 and file_id and data.get("success", True) is not False:
+            return f"https://pixeldrain.com/u/{file_id}"
+        err_detail = data.get("message") or data.get("value") or f"HTTP {status or 'unknown'}"
+        logger.error(f"Pixeldrain upload failed: {err_detail}")
     except Exception as e:
         logger.error(f"Pixeldrain upload failed: {e}")
     return None

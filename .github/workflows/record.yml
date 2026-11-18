@@ -23,6 +23,7 @@ jobs:
       # visible in the Actions UI of this public repo. Add BOT_TOKEN under
       # Settings -> Secrets and variables -> Actions before dispatching.
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

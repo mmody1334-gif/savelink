@@ -2,6 +2,9 @@ import type { Env } from './types'
 import type { Store } from './store'
 import { isRecorderPaused } from './pause'
 import { TelegramApi } from './telegram/api'
+import { markRecordingFinished, markRecordingStarted, watchLockKey } from './active-recordings'
+
+export { watchLockKey }
 
 export interface WatchTarget {
   chatId: number | string
@@ -60,10 +63,6 @@ function resetUnknownStreak(platform: string, identifier: string): void {
 
 export function watchUnknownStreakKey(platform: string, identifier: string): string {
   return `watch:unknown:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
-}
-
-export function watchLockKey(platform: string, identifier: string): string {
-  return `watch:lock:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
 }
 
 export async function clearWatchLock(store: Store, platform: string, identifier: string): Promise<void> {
@@ -380,7 +379,12 @@ function recorderTargetParam(t: WatchTarget): string {
   return t.identifier
 }
 
-async function dispatchRecorder(env: Env, t: WatchTarget, watchMode = '1'): Promise<{ ok: boolean; status: number; body: string }> {
+export async function dispatchRecorderWorkflow(
+  env: Env,
+  model: string,
+  chatId: number | string,
+  watchMode = '0',
+): Promise<{ ok: boolean; status: number; body: string }> {
   const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
   const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`, {
     method: 'POST',
@@ -396,14 +400,18 @@ async function dispatchRecorder(env: Env, t: WatchTarget, watchMode = '1'): Prom
     body: JSON.stringify({
       ref: 'main',
       inputs: {
-        model: recorderTargetParam(t),
-        chat_id: String(t.chatId),
+        model,
+        chat_id: String(chatId),
         watch_mode: watchMode,
       },
     }),
   })
   const body = res.status === 204 ? '' : await res.text().catch(() => '')
   return { ok: res.status === 204 || res.ok, status: res.status, body: body.slice(0, 300) }
+}
+
+async function dispatchRecorder(env: Env, t: WatchTarget, watchMode = '1'): Promise<{ ok: boolean; status: number; body: string }> {
+  return dispatchRecorderWorkflow(env, recorderTargetParam(t), t.chatId, watchMode)
 }
 
 export async function triggerWatchTargetIfLive(
@@ -424,6 +432,14 @@ export async function triggerWatchTargetIfLive(
     const dispatch = await dispatchRecorder(env, t, '1')
     if (dispatch.ok) {
       await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+      await markRecordingStarted(store, {
+        platform: t.platform,
+        model: t.identifier,
+        target: t.target,
+        chatId: Number(t.chatId) || 0,
+        source: 'watch',
+        skipWatchLock: true,
+      })
       return { live: true, triggered: true, detail: check.detail }
     }
     return { live: true, triggered: false, detail: `dispatch_failed_${dispatch.status}` }
@@ -443,6 +459,14 @@ export async function triggerWatchTargetIfLive(
   const dispatch = await dispatchRecorder(env, t, '1')
   if (dispatch.ok) {
     await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+    await markRecordingStarted(store, {
+      platform: t.platform,
+      model: t.identifier,
+      target: t.target,
+      chatId: Number(t.chatId) || 0,
+      source: 'watch',
+      skipWatchLock: true,
+    })
     return { live: false, triggered: true, detail: check.detail || 'cloud_watcher_dispatched' }
   }
 
@@ -509,6 +533,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
             await store.delete(lockKey)
             console.log(`[watch] ${t.platform}/${t.identifier} room not found - cleared lock`)
           }
+          await markRecordingFinished(store, t.identifier, t.platform)
           resetUnknownStreak(t.platform, t.identifier)
           continue
         }
@@ -525,6 +550,14 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
           const dispatch = await dispatchRecorder(env, t, '1')
           if (dispatch.ok) {
             await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+            await markRecordingStarted(store, {
+              platform: t.platform,
+              model: t.identifier,
+              target: t.target,
+              chatId: Number(t.chatId) || 0,
+              source: 'watch',
+              skipWatchLock: true,
+            })
             triggered++
             console.log(`[watch] dispatched cloud watcher for ${t.platform}/${t.identifier} (unknown x${streak})`)
           }
@@ -540,6 +573,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
           await store.delete(lockKey)
           console.log(`[watch] ${t.platform}/${t.identifier} is offline - auto-cleared lock`)
         }
+        await markRecordingFinished(store, t.identifier, t.platform)
         continue
       }
 
@@ -556,6 +590,14 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
 
         // Lock only after a confirmed dispatch, so a failure is retried next cycle.
         await store.put(lockKey, String(Date.now()), SESSION_LOCK_SECONDS)
+        await markRecordingStarted(store, {
+          platform: t.platform,
+          model: t.identifier,
+          target: t.target,
+          chatId: Number(t.chatId) || 0,
+          source: 'watch',
+          skipWatchLock: true,
+        })
         triggered++
 
         if (env.BOT_TOKEN) {
