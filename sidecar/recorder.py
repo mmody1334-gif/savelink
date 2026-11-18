@@ -676,8 +676,8 @@ class RecordingJob:
                             return
                 except Exception:
                     pass
-            # Poll every 20s to balance /stop responsiveness against KV free-tier reads.
-            for _ in range(20):
+            # Poll every 60s to minimize Cloudflare KV reads during long recordings.
+            for _ in range(60):
                 if self.stop_requested or (self.process is not None and self.process.poll() is not None):
                     return
                 time.sleep(1)

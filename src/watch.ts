@@ -26,16 +26,36 @@ const SESSION_LOCK_SECONDS = 7200
 
 /**
  * How often watch targets are checked. Single source of truth: this MUST
- * match the cron trigger in wrangler.toml (every 2 minutes). The user-facing
+ * match the cron trigger in wrangler.toml (every 5 minutes). The user-facing
  * messages in webhook.ts use this value — never hard-code another interval.
  */
-export const WATCH_CHECK_INTERVAL_MINUTES = 2
+export const WATCH_CHECK_INTERVAL_MINUTES = 5
 
 /** Consecutive "unknown" cycles before a cloud watcher is dispatched. */
 export const WATCH_UNKNOWN_STREAK_TO_DISPATCH = 3
 
 /** How long an unknown streak is remembered. */
 const UNKNOWN_STREAK_TTL_SECONDS = 60 * 60 * 24
+
+const unknownStreaks = new Map<string, { count: number; expiresAt: number }>()
+
+function incrUnknownStreak(platform: string, identifier: string): number {
+  const now = Date.now()
+  if (unknownStreaks.size > 500) {
+    for (const [k, v] of unknownStreaks) {
+      if (v.expiresAt <= now) unknownStreaks.delete(k)
+    }
+  }
+  const key = watchUnknownStreakKey(platform, identifier)
+  const cur = unknownStreaks.get(key)
+  const next = !cur || cur.expiresAt <= now ? 1 : cur.count + 1
+  unknownStreaks.set(key, { count: next, expiresAt: now + UNKNOWN_STREAK_TTL_SECONDS * 1000 })
+  return next
+}
+
+function resetUnknownStreak(platform: string, identifier: string): void {
+  unknownStreaks.delete(watchUnknownStreakKey(platform, identifier))
+}
 
 export function watchUnknownStreakKey(platform: string, identifier: string): string {
   return `watch:unknown:${platform.toLowerCase()}:${identifier.toLowerCase().replace(/^@/, '')}`
@@ -46,15 +66,18 @@ export function watchLockKey(platform: string, identifier: string): string {
 }
 
 export async function clearWatchLock(store: Store, platform: string, identifier: string): Promise<void> {
-  await store.delete(watchLockKey(platform, identifier))
+  const key = watchLockKey(platform, identifier)
+  if (await store.get(key)) {
+    await store.delete(key)
+  }
 }
 
 export async function clearAllWatchLocksForTarget(store: Store, target: string): Promise<void> {
   const clean = target.toLowerCase().trim().replace(/^@/, '')
   await Promise.all([
-    store.delete(`watch:lock:chaturbate:${clean}`),
-    store.delete(`watch:lock:stripchat:${clean}`),
-    store.delete(`watch:lock:tiktok:${clean}`),
+    clearWatchLock(store, 'chaturbate', clean),
+    clearWatchLock(store, 'stripchat', clean),
+    clearWatchLock(store, 'tiktok', clean),
   ])
 }
 
@@ -171,10 +194,14 @@ export async function removeWatchTarget(
     await store.put(WATCH_INDEX_KEY, JSON.stringify(newGlobal), WATCH_TTL_SECONDS)
   }
 
-  // Clear locks for this target so future watches or recordings start fresh
+  // Clear locks and in-memory streak for this target so future watches start fresh
   if (parsed) {
+    resetUnknownStreak(parsed.platform, parsed.identifier)
     await clearWatchLock(store, parsed.platform, parsed.identifier)
   } else {
+    resetUnknownStreak('chaturbate', targetStr)
+    resetUnknownStreak('stripchat', targetStr)
+    resetUnknownStreak('tiktok', targetStr)
     await clearAllWatchLocksForTarget(store, targetStr)
   }
 
@@ -479,24 +506,14 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
             await store.delete(lockKey)
             console.log(`[watch] ${t.platform}/${t.identifier} room not found - cleared lock`)
           }
-          await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
+          resetUnknownStreak(t.platform, t.identifier)
           continue
         }
 
-        // "Unknown" also covers one-off network blips. Only a persistent
-        // unknown earns a cloud-watcher runner: the streak must reach
-        // WATCH_UNKNOWN_STREAK_TO_DISPATCH consecutive cycles, and the 2h
-        // session lock still caps it at one runner per target per 2h. The
-        // runner itself runs curl_cffi with full browser TLS impersonation,
-        // which is what gets past the Chaturbate/Stripchat edge WAF (403)
-        // that blocks the Worker.
-        const streak = await store.incr(
-          watchUnknownStreakKey(t.platform, t.identifier),
-          UNKNOWN_STREAK_TTL_SECONDS,
-        )
+        const streak = incrUnknownStreak(t.platform, t.identifier)
         if (streak < WATCH_UNKNOWN_STREAK_TO_DISPATCH) continue
 
-        await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
+        resetUnknownStreak(t.platform, t.identifier)
         const lockKey = watchLockKey(t.platform, t.identifier)
         if (await store.get(lockKey)) {
           continue
@@ -514,7 +531,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
         continue
       }
       if (check.state === 'offline') {
-        await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
+        resetUnknownStreak(t.platform, t.identifier)
         const lockKey = watchLockKey(t.platform, t.identifier)
         if (await store.get(lockKey)) {
           await store.delete(lockKey)
@@ -523,7 +540,7 @@ export async function runWatchCycle(env: Env, store: Store): Promise<{ checked: 
         continue
       }
 
-      await store.delete(watchUnknownStreakKey(t.platform, t.identifier))
+      resetUnknownStreak(t.platform, t.identifier)
       const lockKey = watchLockKey(t.platform, t.identifier)
       if (await store.get(lockKey)) continue
 

@@ -30,9 +30,9 @@ enabled = true
 
 [triggers]
 # Watch cadence: the single source of truth is WATCH_CHECK_INTERVAL_MINUTES
-# in src/watch.ts (2). If this cron changes, update the constant and the
+# in src/watch.ts (5). If this cron changes, update the constant and the
 # user-facing messages that use it.
-crons = ["*/2 * * * *"]
+crons = ["*/5 * * * *"]
 
 # Persistent state: button payloads, result cache and rate limits survive
 # isolate restarts. Free plan includes 100k reads + 1k writes per day.

@@ -85,12 +85,34 @@ apiRoute.get('/health', (c) => {
   })
 })
 
+const SIGNAL_MEMO_MS = 15_000
+const signalMemo = new Map<string, { stop: boolean; at: number }>()
+
+export function invalidateSignalMemo(target: string): void {
+  const clean = target.toLowerCase().trim().replace(/^@/, '')
+  signalMemo.delete(clean)
+  signalMemo.delete(clean.replace(/^_+|_+$/g, ''))
+}
+
 apiRoute.get('/record/signal', async (c) => {
   const target = (c.req.query('target') || '').toLowerCase().trim().replace(/^@/, '')
   if (!target) return c.json({ stop: false })
+  if (c.env.CACHE) {
+    const hit = signalMemo.get(target)
+    if (hit && Date.now() - hit.at < SIGNAL_MEMO_MS) return c.json({ stop: hit.stop })
+  }
   const store = getStore(c.env)
-  const stopped = await store.get(`stop:${target}`)
-  return c.json({ stop: Boolean(stopped) })
+  const stopped = Boolean(await store.get(`stop:${target}`))
+  if (c.env.CACHE) {
+    if (signalMemo.size > 500) {
+      const cutoff = Date.now() - SIGNAL_MEMO_MS
+      for (const [k, v] of signalMemo) {
+        if (v.at <= cutoff) signalMemo.delete(k)
+      }
+    }
+    signalMemo.set(target, { stop: stopped, at: Date.now() })
+  }
+  return c.json({ stop: stopped })
 })
 
 apiRoute.get('/record/signal/clear', async (c) => {
@@ -99,8 +121,11 @@ apiRoute.get('/record/signal/clear', async (c) => {
   const target = (c.req.query('target') || '').toLowerCase().trim().replace(/^@/, '')
   const platform = (c.req.query('platform') || '').toLowerCase().trim()
   if (target) {
+    invalidateSignalMemo(target)
     const store = getStore(c.env)
-    await store.delete(`stop:${target}`)
+    if (await store.get(`stop:${target}`)) {
+      await store.delete(`stop:${target}`)
+    }
     if (platform) {
       await clearWatchLock(store, platform, target)
     } else {
@@ -118,6 +143,7 @@ apiRoute.post('/record/stop', async (c) => {
   if (!target) return c.json({ ok: false, error: 'Target required' }, 400)
   const store = getStore(c.env)
   await store.put(`stop:${target}`, '1', 3600)
+  invalidateSignalMemo(target)
   return c.json({ ok: true, message: 'Stop signal sent' })
 })
 

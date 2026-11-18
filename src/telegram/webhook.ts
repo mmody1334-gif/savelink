@@ -24,6 +24,7 @@ import {
 import { handleMovieCallback, handleMovieCommand } from './movie-handlers'
 import { handleBypassCommand } from './bypass-handlers'
 import { isPaused, setPaused, canControlPause, isPauseConfigured, cancelAllGitHubRuns } from '../pause'
+import { invalidateSignalMemo } from '../routes/api'
 import {
   handleAiCommand,
   handleAudioMessage,
@@ -3125,6 +3126,7 @@ async function handleStopCommand(
     if (trimmed && trimmed !== cleanModel) {
       await store.put(`stop:${trimmed}`, '1', 3600)
     }
+    invalidateSignalMemo(cleanModel)
 
     if (endpoint) {
       const base = endpoint.replace(/\/+$/, '')
@@ -3193,6 +3195,7 @@ async function handleRecordCallback(
       if (trimmed && trimmed !== cleanModel) {
         await _store.put(`stop:${trimmed}`, '1', 3600)
       }
+      invalidateSignalMemo(cleanModel)
 
       if (endpoint) {
         const base = endpoint.replace(/\/+$/, '')

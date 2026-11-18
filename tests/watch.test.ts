@@ -14,7 +14,7 @@ import {
   WATCH_CHECK_INTERVAL_MINUTES,
   WATCH_UNKNOWN_STREAK_TO_DISPATCH,
 } from '../src/watch'
-import { getStore } from '../src/store'
+import { checkRateLimit, getStore } from '../src/store'
 
 describe('Watch & Auto-record', () => {
   let store: any
@@ -215,8 +215,8 @@ describe('Watch & Auto-record', () => {
     }
   })
 
-  it('check interval is a single source of truth matching the 2-minute cron', () => {
-    expect(WATCH_CHECK_INTERVAL_MINUTES).toBe(2)
+  it('check interval is a single source of truth matching the 5-minute cron', () => {
+    expect(WATCH_CHECK_INTERVAL_MINUTES).toBe(5)
     expect(WATCH_UNKNOWN_STREAK_TO_DISPATCH).toBe(3)
   })
 
@@ -400,5 +400,89 @@ describe('Watch & Auto-record', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+
+  it('performs zero KV writes or deletes across offline and sub-threshold unknown cycles', async () => {
+    const originalFetch = globalThis.fetch
+    let mode: 'offline' | 'unknown' = 'offline'
+    globalThis.fetch = vi.fn().mockImplementation(async () => {
+      if (mode === 'offline') {
+        return new Response(JSON.stringify({ room_status: 'offline' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response('Forbidden', { status: 403 })
+    })
+
+    let writes = 0
+    let deletes = 0
+    let incrs = 0
+    const trackedStore = {
+      get: (k: string) => store.get(k),
+      put: async (k: string, v: string, ttl?: number) => {
+        writes += 1
+        return store.put(k, v, ttl)
+      },
+      delete: async (k: string) => {
+        deletes += 1
+        return store.delete(k)
+      },
+      incr: async (k: string, ttl: number) => {
+        incrs += 1
+        return store.incr(k, ttl)
+      },
+    }
+
+    try {
+      await addWatchTarget(780, 'zero_kv_model', store)
+      const env: any = { GITHUB_TOKEN: 'fake_token', BOT_TOKEN: 'fake_bot' }
+
+      mode = 'offline'
+      for (let i = 0; i < 4; i += 1) {
+        const res = await runWatchCycle(env, trackedStore)
+        expect(res.checked).toBe(1)
+        expect(res.triggered).toBe(0)
+      }
+      expect(writes).toBe(0)
+      expect(deletes).toBe(0)
+      expect(incrs).toBe(0)
+
+      mode = 'unknown'
+      for (let i = 0; i < 2; i += 1) {
+        const res = await runWatchCycle(env, trackedStore)
+        expect(res.unknown).toBe(1)
+        expect(res.triggered).toBe(0)
+      }
+      expect(writes).toBe(0)
+      expect(deletes).toBe(0)
+      expect(incrs).toBe(0)
+    } finally {
+      globalThis.fetch = originalFetch
+      await removeWatchTarget(780, 'zero_kv_model', store)
+    }
+  })
+
+  it('routes ephemeral u: and rl: keys to isolate memory without touching KVNamespace', async () => {
+    const kv = {
+      get: vi.fn(async () => null),
+      put: vi.fn(async () => {}),
+      delete: vi.fn(async () => {}),
+    } as unknown as KVNamespace
+
+    const kvStore = getStore({ CACHE: kv } as any)
+    const rl = await checkRateLimit(kvStore, 12345, 12)
+    expect(rl.ok).toBe(true)
+    expect(rl.used).toBe(1)
+
+    await kvStore.put('u:777888', '1', 600)
+    expect(await kvStore.get('u:777888')).toBe('1')
+
+    expect(kv.get).not.toHaveBeenCalled()
+    expect(kv.put).not.toHaveBeenCalled()
+    expect(kv.delete).not.toHaveBeenCalled()
+
+    await kvStore.put('m:test_ephemeral_check', 'val', 600)
+    expect(kv.put).toHaveBeenCalledTimes(1)
   })
 })
