@@ -1,12 +1,36 @@
 import { execSync } from 'node:child_process'
+import dns from 'node:dns'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+dns.setDefaultResultOrder('ipv4first')
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 const REPO = process.env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
 const BRANCH = 'main'
+
+async function fetchWithRetry(url, init = {}, attempts = 3) {
+  let lastErr = null
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      const res = await fetch(url, init)
+      if ((res.status === 502 || res.status === 503 || res.status === 504) && i < attempts) {
+        await new Promise((r) => setTimeout(r, 1000 * i))
+        continue
+      }
+      return res
+    } catch (err) {
+      lastErr = err
+      if (i < attempts) {
+        await new Promise((r) => setTimeout(r, 1000 * i))
+      }
+    }
+  }
+  const cause = lastErr?.cause ? ` (${lastErr.cause.message || lastErr.cause})` : ''
+  throw new Error(`${lastErr?.message || 'fetch failed'}${cause}`)
+}
 
 const FILE_MAP = [
   { local: 'recorder.py', remote: 'recorder.py', mode: '100644' },
@@ -32,7 +56,7 @@ function resolveToken() {
 }
 
 async function ghJson(token, endpoint, init = {}) {
-  const res = await fetch(`https://api.github.com/repos/${REPO}${endpoint}`, {
+  const res = await fetchWithRetry(`https://api.github.com/repos/${REPO}${endpoint}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
@@ -59,7 +83,7 @@ async function ghJson(token, endpoint, init = {}) {
 }
 
 async function fetchRemoteRaw(token, remotePath, ref = BRANCH) {
-  const res = await fetch(`https://api.github.com/repos/${REPO}/contents/${remotePath}?ref=${encodeURIComponent(ref)}`, {
+  const res = await fetchWithRetry(`https://api.github.com/repos/${REPO}/contents/${remotePath}?ref=${encodeURIComponent(ref)}`, {
     headers: {
       Authorization: `Bearer ${token}`,
       'User-Agent': 'savelink-sync-recorder',
