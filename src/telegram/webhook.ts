@@ -3148,10 +3148,12 @@ async function handleRecordCommand(
   }
 
   const cleanStopKey = model.replace(/^@/, '').toLowerCase()
-  if (await store.get(`stop:${cleanStopKey}`)) {
-    await store.delete(`stop:${cleanStopKey}`)
-    invalidateSignalMemo(cleanStopKey)
-  }
+  try {
+    if (await store.get(`stop:${cleanStopKey}`)) {
+      await store.delete(`stop:${cleanStopKey}`)
+      invalidateSignalMemo(cleanStopKey)
+    }
+  } catch {}
 
   const statusMsg = await tg.call<{ message_id: number }>('sendMessage', {
     chat_id: chatId,
@@ -3297,13 +3299,17 @@ async function handleRecordCommand(
       }
     }
 
-    await markRecordingStarted(store, {
-      platform: normalizeRecPlatform(platformLabel),
-      model,
-      target: clean,
-      chatId,
-      source: 'manual',
-    })
+    try {
+      await markRecordingStarted(store, {
+        platform: normalizeRecPlatform(platformLabel),
+        model,
+        target: clean,
+        chatId,
+        source: 'manual',
+      })
+    } catch (err) {
+      console.warn('[record] markRecordingStarted failed:', (err as Error)?.message || err)
+    }
 
     const startMsg = (lang === 'ar'
       ? `🔴 <b>جاري الاتصال وتسجيل بث ${platformLabel} في السحابة!</b>\n\n` +

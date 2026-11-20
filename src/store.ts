@@ -55,16 +55,44 @@ class MemoryStore implements Store {
   }
 }
 
+const kvFallbackKeys = new Set<string>()
+
+export function clearKvFallbackState(): void {
+  kvFallbackKeys.clear()
+}
+
 class KvStore implements Store {
   constructor(private readonly kv: KVNamespace) {}
 
-  // Ephemeral webhook dedupe and rate-limit keys stay in isolate memory to avoid burning daily KV write quota.
+  private static readonly EPHEMERAL_PREFIXES = [
+    'u:',
+    'rl:',
+    'v4:',
+    'm:',
+    'ytv:',
+    'ytpl:',
+    'cmr:',
+    'erm_s:',
+    'erm_alb:',
+    'bkr_s:',
+    'bkr_alb:',
+    'mov_s:',
+    'mov_d:',
+    'mov_e:',
+    'rec:active:',
+    'watch:lock:',
+    'stop:',
+  ]
+
+  // Ephemeral caches, button payloads, locks and rate-limits stay in isolate memory to avoid burning daily KV write quota.
   private static isEphemeral(key: string): boolean {
-    return key.startsWith('u:') || key.startsWith('rl:')
+    return KvStore.EPHEMERAL_PREFIXES.some((prefix) => key.startsWith(prefix))
   }
 
   async get(key: string): Promise<string | null> {
-    if (KvStore.isEphemeral(key)) return await memory.get(key)
+    if (KvStore.isEphemeral(key) || kvFallbackKeys.has(key)) {
+      return await memory.get(key)
+    }
     return await this.kv.get(key)
   }
 
@@ -73,7 +101,14 @@ class KvStore implements Store {
       await memory.put(key, value, ttlSeconds)
       return
     }
-    await this.kv.put(key, value, { expirationTtl: Math.max(60, ttlSeconds) })
+    await memory.put(key, value, ttlSeconds)
+    try {
+      await this.kv.put(key, value, { expirationTtl: Math.max(60, ttlSeconds) })
+      kvFallbackKeys.delete(key)
+    } catch (err) {
+      kvFallbackKeys.add(key)
+      console.warn('[store] KV put failed, falling back to isolate memory for', key, (err as Error)?.message || err)
+    }
   }
 
   async delete(key: string): Promise<void> {
@@ -81,12 +116,18 @@ class KvStore implements Store {
       await memory.delete(key)
       return
     }
-    await this.kv.delete(key)
+    await memory.delete(key)
+    kvFallbackKeys.delete(key)
+    try {
+      await this.kv.delete(key)
+    } catch (err) {
+      console.warn('[store] KV delete failed, cleared in isolate memory for', key, (err as Error)?.message || err)
+    }
   }
 
   async incr(key: string, ttlSeconds: number): Promise<number> {
-    if (KvStore.isEphemeral(key)) return await memory.incr(key, ttlSeconds)
-    const next = Number((await this.kv.get(key)) ?? 0) + 1
+    if (KvStore.isEphemeral(key) || kvFallbackKeys.has(key)) return await memory.incr(key, ttlSeconds)
+    const next = Number((await this.get(key)) ?? 0) + 1
     await this.put(key, String(next), ttlSeconds)
     return next
   }

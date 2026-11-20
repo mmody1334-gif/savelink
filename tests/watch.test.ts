@@ -14,7 +14,7 @@ import {
   WATCH_CHECK_INTERVAL_MINUTES,
   WATCH_UNKNOWN_STREAK_TO_DISPATCH,
 } from '../src/watch'
-import { checkRateLimit, getStore } from '../src/store'
+import { checkRateLimit, clearKvFallbackState, getStore } from '../src/store'
 
 describe('Watch & Auto-record', () => {
   let store: any
@@ -29,12 +29,24 @@ describe('Watch & Auto-record', () => {
     await clearAllWatchLocksForTarget(store, 'modelx')
   })
 
-  it('parses TikTok target correctly', () => {
+  it('parses TikTok target correctly and rejects bare short share URLs without @username', async () => {
     const res1 = parseWatchTarget('@shad.208')
     expect(res1).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208' })
 
     const res2 = parseWatchTarget('https://www.tiktok.com/@shad.208/live')
     expect(res2).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208' })
+
+    expect(parseWatchTarget('https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/')).toBeNull()
+    expect(parseWatchTarget('@https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/')).toBeNull()
+
+    const badCheck = await checkTargetLive({
+      chatId: 736161596,
+      target: '@https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/',
+      platform: 'tiktok',
+      identifier: 'https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/',
+      addedAt: 0,
+    })
+    expect(badCheck).toEqual({ state: 'unknown', detail: 'no_such_room' })
   })
 
   it('parses Chaturbate target correctly', () => {
@@ -463,11 +475,17 @@ describe('Watch & Auto-record', () => {
     }
   })
 
-  it('routes ephemeral u: and rl: keys to isolate memory without touching KVNamespace', async () => {
+  it('routes ephemeral keys to isolate memory and falls back cleanly when KV put() limit is exceeded', async () => {
+    clearKvFallbackState()
+    let failPut = false
     const kv = {
       get: vi.fn(async () => null),
-      put: vi.fn(async () => {}),
-      delete: vi.fn(async () => {}),
+      put: vi.fn(async () => {
+        if (failPut) throw new Error('KV put() limit exceeded for the day.')
+      }),
+      delete: vi.fn(async () => {
+        if (failPut) throw new Error('KV delete() limit exceeded for the day.')
+      }),
     } as unknown as KVNamespace
 
     const kvStore = getStore({ CACHE: kv } as any)
@@ -475,14 +493,23 @@ describe('Watch & Auto-record', () => {
     expect(rl.ok).toBe(true)
     expect(rl.used).toBe(1)
 
-    await kvStore.put('u:777888', '1', 600)
-    expect(await kvStore.get('u:777888')).toBe('1')
+    for (const k of ['u:777888', 'm:btn1', 'v4:video:max:https://x', 'rec:active:all', 'watch:lock:chaturbate:m1', 'stop:m1']) {
+      await kvStore.put(k, '1', 600)
+      expect(await kvStore.get(k)).toBe('1')
+    }
 
     expect(kv.get).not.toHaveBeenCalled()
     expect(kv.put).not.toHaveBeenCalled()
     expect(kv.delete).not.toHaveBeenCalled()
 
-    await kvStore.put('m:test_ephemeral_check', 'val', 600)
+    await kvStore.put('archive:user:123', '["ok"]', 3600)
     expect(kv.put).toHaveBeenCalledTimes(1)
+
+    // Simulate Cloudflare daily KV put() limit exceeded
+    failPut = true
+    await expect(kvStore.put('archive:user:123', '["fallback_saved"]', 3600)).resolves.toBeUndefined()
+    expect(await kvStore.get('archive:user:123')).toBe('["fallback_saved"]')
+    await expect(kvStore.delete('archive:user:123')).resolves.toBeUndefined()
+    clearKvFallbackState()
   })
 })

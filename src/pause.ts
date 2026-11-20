@@ -20,11 +20,15 @@ export async function isPaused(env: Env): Promise<boolean> {
 }
 
 export async function setPaused(env: Env, paused: boolean, by?: number | string): Promise<void> {
-  if (env.CACHE) {
-    if (paused) await env.CACHE.put(PAUSE_KEY, JSON.stringify({ by: by ?? null, at: Date.now() }))
-    else if (await env.CACHE.get(PAUSE_KEY)) await env.CACHE.delete(PAUSE_KEY)
-  }
   memo = { value: paused, at: Date.now() }
+  if (env.CACHE) {
+    try {
+      if (paused) await env.CACHE.put(PAUSE_KEY, JSON.stringify({ by: by ?? null, at: Date.now() }))
+      else if (await env.CACHE.get(PAUSE_KEY)) await env.CACHE.delete(PAUSE_KEY)
+    } catch (err) {
+      console.warn('[pause] KV write failed, using in-memory memo:', (err as Error)?.message || err)
+    }
+  }
 }
 
 export async function isRecorderPaused(env: Env): Promise<boolean> {
@@ -35,11 +39,15 @@ export async function isRecorderPaused(env: Env): Promise<boolean> {
 }
 
 export async function setRecorderPaused(env: Env, paused: boolean, by?: number | string): Promise<void> {
-  if (env.CACHE) {
-    if (paused) await env.CACHE.put(RECORDER_PAUSE_KEY, JSON.stringify({ by: by ?? null, at: Date.now() }))
-    else if (await env.CACHE.get(RECORDER_PAUSE_KEY)) await env.CACHE.delete(RECORDER_PAUSE_KEY)
-  }
   recorderMemo = { value: paused, at: Date.now() }
+  if (env.CACHE) {
+    try {
+      if (paused) await env.CACHE.put(RECORDER_PAUSE_KEY, JSON.stringify({ by: by ?? null, at: Date.now() }))
+      else if (await env.CACHE.get(RECORDER_PAUSE_KEY)) await env.CACHE.delete(RECORDER_PAUSE_KEY)
+    } catch (err) {
+      console.warn('[pause] KV write failed, using in-memory recorderMemo:', (err as Error)?.message || err)
+    }
+  }
 }
 
 /** True when OWNER_ID lists at least one Telegram user id. */

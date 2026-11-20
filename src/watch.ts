@@ -106,8 +106,12 @@ export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturb
 
   // TikTok
   if (clean.includes('tiktok.com') || clean.startsWith('@')) {
-    const m = clean.match(/@([a-zA-Z0-9_.-]+)/)
-    const id = m ? m[1] : clean.replace(/^@/, '')
+    if (/^@https?:\/\//i.test(clean)) return null
+    const m =
+      clean.match(/@([a-zA-Z0-9_.-]{2,40})(?:\/|$|\?)/) ||
+      (!clean.includes('/') && !clean.includes(':') ? clean.replace(/^@/, '').match(/^([a-zA-Z0-9_.-]{2,40})$/) : null)
+    if (!m) return null
+    const id = m[1]
     return { platform: 'tiktok', identifier: id, clean: `@${id}` }
   }
 
@@ -222,7 +226,10 @@ const CB_ON_AIR = new Set(['public', 'private', 'group', 'hidden', 'away', 'pass
  * (404, non-JSON, blocked, timeout) and must never be treated as offline.
  */
 export async function checkTargetLive(target: WatchTarget): Promise<LiveCheck> {
-  const id = target.identifier.replace(/^@/, '').toLowerCase()
+  const id = target.identifier.replace(/^@/, '').toLowerCase().trim()
+  if (!id || /[/:?#]/.test(id)) {
+    return { state: 'unknown', detail: 'no_such_room' }
+  }
 
   if (target.platform === 'chaturbate') {
     const desktopUa =

@@ -394,4 +394,64 @@ describe('active recordings tracking, duplicate lock & /status', () => {
     expect(active).toHaveLength(1)
     expect(active[0].source).toBe('continuation')
   })
+
+  it('completes /record and sends confirmation even when KV put() limit is exceeded for the day', async () => {
+    const dispatches: any[] = []
+    const tgCalls: Array<{ method: string; body: any }> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('chatvideocontext')) {
+          return new Response(
+            JSON.stringify({ room_status: 'public', hls_source: 'https://edge.example.com/live.m3u8' }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (url.includes('/dispatches')) {
+          dispatches.push(init?.body ? JSON.parse(String(init.body)) : {})
+          return new Response(null, { status: 204 })
+        }
+        if (url.includes('api.telegram.org')) {
+          const method = url.split('/').pop() || ''
+          tgCalls.push({ method, body: init?.body ? JSON.parse(String(init.body)) : {} })
+          return new Response(JSON.stringify({ ok: true, result: { message_id: 95 } }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        return new Response('not found', { status: 404 })
+      }),
+    )
+
+    const exhaustedKv = {
+      get: vi.fn(async () => null),
+      put: vi.fn(async () => {
+        throw new Error('KV put() limit exceeded for the day.')
+      }),
+      delete: vi.fn(async () => {
+        throw new Error('KV put() limit exceeded for the day.')
+      }),
+    } as unknown as KVNamespace
+
+    const env = makeEnv({ CACHE: exhaustedKv })
+    const res = await sendWebhookUpdate(
+      {
+        update_id: 699,
+        message: {
+          message_id: 9,
+          chat: { id: 736161596, type: 'private' },
+          from: { id: 736161596, language_code: 'ar' },
+          text: '/record momgoeswild',
+        },
+      },
+      env,
+    )
+    expect(res.status).toBe(200)
+    expect(dispatches).toHaveLength(1)
+
+    const editMsg = tgCalls.find((c) => c.method === 'editMessageText')
+    expect(editMsg?.body.text).toContain('جاري الاتصال وتسجيل بث')
+    expect(editMsg?.body.text).not.toContain('KV put() limit exceeded')
+  })
 })
