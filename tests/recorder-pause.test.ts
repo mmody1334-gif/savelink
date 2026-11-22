@@ -7,6 +7,15 @@ import { getStore } from '../src/store'
 import type { Env } from '../src/types'
 import { addWatchTarget, removeWatchTarget, runWatchCycle } from '../src/watch'
 
+let lastPendingWebhook: Promise<unknown> | undefined
+function captureWaitUntil(): any {
+  return { waitUntil: (p: Promise<unknown>) => { lastPendingWebhook = p } }
+}
+async function flushWebhook(): Promise<void> {
+  await lastPendingWebhook
+  lastPendingWebhook = undefined
+}
+
 const BOT_TOKEN = '999:test-bot-token'
 const WEBHOOK_SECRET = 'test-webhook-secret'
 const OWNER = '736161596'
@@ -27,7 +36,9 @@ async function sendWebhookUpdate(update: Record<string, unknown>, env: Env) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(update),
   })
-  return await worker.fetch(req, env, { waitUntil: () => {} } as any)
+  const res = await worker.fetch(req, env, captureWaitUntil())
+  await flushWebhook()
+  return res
 }
 
 afterEach(async () => {
