@@ -12,6 +12,8 @@ export interface FacebookProfileInfo {
   hd: boolean
   storyBucketId?: string
   highlightId?: string
+  /** every highlight collection id found on the profile, in page order */
+  highlightIds?: string[]
 }
 
 export interface FacebookProfileResult {
@@ -132,13 +134,17 @@ export async function resolveFacebookProfile(input: {
   }
 
   if (html.includes('login_attempt') || html.includes('id="login_form"')) {
-    if (!env.FB_COOKIE) {
-      throw new EngineError(
-        'Facebook profile requires a login session or is private. Set FB_COOKIE.',
-        'facebook-profile',
-        false,
-      )
-    }
+    // Facebook answered with the login wall. With no cookie that means the
+    // profile needs a session; WITH a cookie it means the session was
+    // rejected. Scraping the login page would only invent a phantom profile
+    // (no avatar, no photos, no highlights), so stop here instead.
+    throw new EngineError(
+      env.FB_COOKIE
+        ? 'Facebook session (FB_COOKIE) expired or was rejected - Facebook returned the login page. Renew FB_COOKIE.'
+        : 'Facebook profile requires a login session or is private. Set FB_COOKIE.',
+      'facebook-profile',
+      false,
+    )
   }
 
   if (html.includes('هذا المحتوى غير متوفر') || html.includes("This content isn't available")) {
@@ -223,11 +229,24 @@ export async function resolveFacebookProfile(input: {
 
   const isHd = avatarUrl.includes('mx') || avatarUrl.includes('1080') || avatarUrl.includes('2048')
 
-  const highlightMatch =
-    html.match(/\/stories\/highlights\/(\d+)/) ||
-    html.match(/"highlight_id":"(\d+)"/) ||
-    html.match(/"collection_id":"(\d+)"/)
-  const highlightId = highlightMatch?.[1]
+  // Facebook embeds most profile data as relay JSON in which every URL
+  // slash is escaped ("https:\/\/..."), so a highlights shelf link shows up
+  // as "\/stories\/highlights\/<id>" and a raw-HTML match misses it. Match
+  // on a slash-unescaped copy too, and keep ALL collection ids: a profile
+  // can have several highlight collections, not just one.
+  const unescapedHtml = html.replace(/\\\//g, '/')
+  const highlightIds: string[] = []
+  const seenHighlightId = new Set<string>()
+  const addHighlightId = (id: string | undefined) => {
+    if (id && id !== '0' && !seenHighlightId.has(id)) {
+      seenHighlightId.add(id)
+      highlightIds.push(id)
+    }
+  }
+  for (const m of unescapedHtml.matchAll(/\/stories\/highlights\/(\d+)/g)) addHighlightId(m[1])
+  for (const m of html.matchAll(/"highlight_id":"(\d+)"/g)) addHighlightId(m[1])
+  for (const m of html.matchAll(/"collection_id":"(\d+)"/g)) addHighlightId(m[1])
+  const highlightId = highlightIds[0]
 
   const photos = extractFacebookPhotos(html, maxItems, avatarUrl)
 
@@ -249,6 +268,7 @@ export async function resolveFacebookProfile(input: {
       hd: isHd,
       storyBucketId,
       highlightId,
+      highlightIds,
     },
     items: [avatarItem, ...photos],
     photos,
