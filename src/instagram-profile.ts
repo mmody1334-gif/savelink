@@ -745,20 +745,36 @@ export async function resolveInstagramProfile(options: ProfileOptions): Promise<
     // Prefer free/fast IG_COOKIE archive before paid Apify API calls.
     if (options.env.IG_COOKIE) {
       try {
-        const page = await fetchArchivePage({
-          username,
-          env: options.env,
-          pageSize: options.maxItems ?? 50,
-        })
-        if (page.items.length > 0) {
-          const mediaList = page.items.slice(0, options.maxItems ?? 100)
+        // Paginate the archive until the cap is reached: one GraphQL/feed page
+        // carries ~12-50 posts, which used to be the hard ceiling on /photos.
+        const cap = Math.max(1, options.maxItems ?? 100)
+        const collected: MediaItem[] = []
+        let collectedVideos = 0
+        let cursor: string | undefined
+        let more = false
+        for (let pageNum = 0; pageNum < 10 && collected.length < cap; pageNum += 1) {
+          const page = await fetchArchivePage({
+            username,
+            env: options.env,
+            cursor,
+            pageSize: Math.min(50, cap - collected.length),
+          })
+          if (!page.items.length) break
+          collectedVideos += page.videoCount
+          collected.push(...page.items)
+          cursor = page.nextCursor
+          more = Boolean(cursor)
+          if (!cursor) break
+        }
+        if (collected.length > 0) {
+          const mediaList = collected.slice(0, cap)
           return {
             info,
             items: [avatar, ...mediaList],
             photos: mediaList,
             photoCount: mediaList.length,
-            videoCount: page.videoCount,
-            truncated: Boolean(info.posts && info.posts > mediaList.length),
+            videoCount: collectedVideos,
+            truncated: more || Boolean(info.posts && info.posts > mediaList.length),
           }
         }
       } catch {
