@@ -135,4 +135,83 @@ describe('resolveFacebookProfile', () => {
       globalThis.fetch = originalFetch
     }
   })
+
+  it('finds every highlight collection behind Facebook\'s escaped-slash JSON', async () => {
+    // Relay JSON inside the page escapes every slash, so a highlights shelf
+    // link arrives as "https:\/\/www.facebook.com\/stories\/highlights\/<id>\".
+    // A raw-HTML match for "/stories/highlights/" misses it.
+    const mockHtml = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <meta property="og:title" content="Aas Abrii" />
+          <meta property="og:image" content="https://scontent.fbcdn.net/v/avatar.jpg?stp=mx1080x1080" />
+        </head>
+        <body>
+          <a href="/stories/highlights/987654321/">Highlights</a>
+          <script>
+            {"userID":"61550011223344"}
+            {"url":"https:\\/\\/www.facebook.com\\/stories\\/highlights\\/123456789\\/"}
+            {"highlight_id":"555000111"}
+            {"url":"https:\\/\\/www.facebook.com\\/stories\\/highlights\\/123456789\\/?ref=profile"}
+          </script>
+        </body>
+      </html>
+    `
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(mockHtml),
+    } as any)
+
+    try {
+      const res = await resolveFacebookProfile({
+        target: 'https://www.facebook.com/aasabrii',
+        env: { FB_COOKIE: 'session' },
+        maxItems: 10,
+      })
+
+      expect(res.info.highlightIds).toEqual(['987654321', '123456789', '555000111'])
+      expect(res.info.highlightId).toBe('987654321')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('reports an expired session when the login wall arrives WITH a cookie set', async () => {
+    const loginWall = `
+      <!DOCTYPE html>
+      <html>
+        <head><title>Log into Facebook</title></head>
+        <body><form id="login_form" action="/login/?login_attempt=1"></form></body>
+      </html>
+    `
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: () => Promise.resolve(loginWall),
+    } as any)
+
+    try {
+      await expect(
+        resolveFacebookProfile({
+          target: 'https://www.facebook.com/aasabrii',
+          env: { FB_COOKIE: 'stale' },
+        }),
+      ).rejects.toThrow(/expired|rejected/i)
+
+      await expect(
+        resolveFacebookProfile({
+          target: 'https://www.facebook.com/aasabrii',
+          env: {},
+        }),
+      ).rejects.toThrow(/login session|Set FB_COOKIE/i)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
 })
