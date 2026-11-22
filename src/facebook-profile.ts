@@ -1,5 +1,6 @@
 import { EngineError } from './errors'
 import { DESKTOP_UA, decodeEscapes, fetchText } from './http'
+import { extractFbDtsg, fetchFacebookHighlightCollections } from './facebook-graphql'
 import type { Env, MediaItem } from './types'
 
 const FB_REFERER = 'https://www.facebook.com/'
@@ -246,6 +247,22 @@ export async function resolveFacebookProfile(input: {
   for (const m of unescapedHtml.matchAll(/\/stories\/highlights\/(\d+)/g)) addHighlightId(m[1])
   for (const m of html.matchAll(/"highlight_id":"(\d+)"/g)) addHighlightId(m[1])
   for (const m of html.matchAll(/"collection_id":"(\d+)"/g)) addHighlightId(m[1])
+
+  // The highlights shelf no longer ships in the server-rendered profile HTML;
+  // the web app loads it through a deferred GraphQL tile query. When the HTML
+  // gives us nothing, replay that query with the session cookie so highlight
+  // collections are still discovered.
+  if (!highlightIds.length && userId && env.FB_COOKIE) {
+    try {
+      const dtsg = extractFbDtsg(html)
+      if (dtsg) {
+        const collections = await fetchFacebookHighlightCollections(userId, dtsg, env)
+        for (const c of collections) addHighlightId(c.id)
+      }
+    } catch {
+      // discovery fallback must never break the profile flow
+    }
+  }
   const highlightId = highlightIds[0]
 
   const photos = extractFacebookPhotos(html, maxItems, avatarUrl)
