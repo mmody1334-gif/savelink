@@ -93,7 +93,15 @@ export interface LiveCheck {
   recordable?: boolean
 }
 
-export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturbate' | 'stripchat'; identifier: string; clean: string } | null {
+export interface ParsedWatchTarget {
+  platform: 'tiktok' | 'chaturbate' | 'stripchat'
+  identifier: string
+  clean: string
+  /** true when the input named the platform (URL, @handle, prefix); false for a bare name that defaulted to Chaturbate */
+  explicitPlatform: boolean
+}
+
+export function parseWatchTarget(input: string): ParsedWatchTarget | null {
   const clean = input.trim()
   if (!clean) return null
 
@@ -101,7 +109,7 @@ export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturb
   const sc = clean.match(/stripchat\.(?:com|org|me|cc)\/(?:[a-z]{2}\/)?([a-zA-Z0-9_.-]+)/i) || clean.match(/^stripchat_([a-zA-Z0-9_.-]+)$/i)
   if (sc) {
     const id = sc[1].toLowerCase().replace(/\/(?:videos?|vod|clips?|archive)\/?$/i, '')
-    return { platform: 'stripchat', identifier: id, clean: `https://stripchat.com/${id}` }
+    return { platform: 'stripchat', identifier: id, clean: `https://stripchat.com/${id}`, explicitPlatform: true }
   }
 
   // TikTok
@@ -112,17 +120,21 @@ export function parseWatchTarget(input: string): { platform: 'tiktok' | 'chaturb
       (!clean.includes('/') && !clean.includes(':') ? clean.replace(/^@/, '').match(/^([a-zA-Z0-9_.-]{2,40})$/) : null)
     if (!m) return null
     const id = m[1]
-    return { platform: 'tiktok', identifier: id, clean: `@${id}` }
+    return { platform: 'tiktok', identifier: id, clean: `@${id}`, explicitPlatform: true }
   }
 
   // Chaturbate
   const cb =
     clean.match(/chaturbate\.com\/(?:b\/)?([a-zA-Z0-9_.-]+)/i) ||
-    clean.match(/^(?:cb|chaturbate)[:_]([a-zA-Z0-9_.-]+)$/i) ||
-    clean.match(/^([a-zA-Z0-9_.-]{3,60})$/)
+    clean.match(/^(?:cb|chaturbate)[:_]([a-zA-Z0-9_.-]+)$/i)
   if (cb) {
     const id = cb[1].toLowerCase()
-    return { platform: 'chaturbate', identifier: id, clean: id }
+    return { platform: 'chaturbate', identifier: id, clean: id, explicitPlatform: true }
+  }
+  const bare = clean.match(/^([a-zA-Z0-9_.-]{3,60})$/)
+  if (bare) {
+    const id = bare[1].toLowerCase()
+    return { platform: 'chaturbate', identifier: id, clean: id, explicitPlatform: false }
   }
 
   return null
@@ -176,15 +188,19 @@ export async function removeWatchTarget(
 ): Promise<{ ok: boolean; count: number }> {
   const parsed = parseWatchTarget(rawTarget)
   const targetStr = parsed ? parsed.identifier.toLowerCase() : rawTarget.trim().toLowerCase().replace(/^@/, '')
+  // A platform the user named explicitly (URL / @handle / prefix) scopes the removal;
+  // a bare name keeps the old behavior of removing every platform's entry with that name.
+  const scopePlatform = parsed?.explicitPlatform ? parsed.platform : null
+  const nameMatches = (t: WatchTarget): boolean =>
+    t.identifier.toLowerCase() === targetStr || t.target.toLowerCase() === targetStr
+  const keep = (t: WatchTarget): boolean => !nameMatches(t) || (scopePlatform !== null && t.platform !== scopePlatform)
 
   const userKey = `watch:user:${chatId}`
   const userListRaw = await store.get(userKey)
   const userList: WatchTarget[] = userListRaw ? JSON.parse(userListRaw) : []
 
   const beforeLen = userList.length
-  const filtered = userList.filter(
-    (t) => t.identifier.toLowerCase() !== targetStr && t.target.toLowerCase() !== targetStr,
-  )
+  const filtered = userList.filter(keep)
   const removed = beforeLen - filtered.length
   await store.put(userKey, JSON.stringify(filtered), WATCH_TTL_SECONDS)
 
@@ -193,15 +209,15 @@ export async function removeWatchTarget(
   if (indexRaw) {
     const globalList: WatchTarget[] = JSON.parse(indexRaw)
     const newGlobal = globalList.filter(
-      (t) => !(String(t.chatId) === String(chatId) && (t.identifier.toLowerCase() === targetStr || t.target.toLowerCase() === targetStr)),
+      (t) => String(t.chatId) !== String(chatId) || keep(t),
     )
     await store.put(WATCH_INDEX_KEY, JSON.stringify(newGlobal), WATCH_TTL_SECONDS)
   }
 
   // Clear locks and in-memory streak for this target so future watches start fresh
-  if (parsed) {
-    resetUnknownStreak(parsed.platform, parsed.identifier)
-    await clearWatchLock(store, parsed.platform, parsed.identifier)
+  if (scopePlatform && parsed) {
+    resetUnknownStreak(scopePlatform, parsed.identifier)
+    await clearWatchLock(store, scopePlatform, parsed.identifier)
   } else {
     resetUnknownStreak('chaturbate', targetStr)
     resetUnknownStreak('stripchat', targetStr)
