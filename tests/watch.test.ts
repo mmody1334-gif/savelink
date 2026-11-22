@@ -31,10 +31,10 @@ describe('Watch & Auto-record', () => {
 
   it('parses TikTok target correctly and rejects bare short share URLs without @username', async () => {
     const res1 = parseWatchTarget('@shad.208')
-    expect(res1).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208' })
+    expect(res1).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208', explicitPlatform: true })
 
     const res2 = parseWatchTarget('https://www.tiktok.com/@shad.208/live')
-    expect(res2).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208' })
+    expect(res2).toEqual({ platform: 'tiktok', identifier: 'shad.208', clean: '@shad.208', explicitPlatform: true })
 
     expect(parseWatchTarget('https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/')).toBeNull()
     expect(parseWatchTarget('@https://vt.tiktok.com/ZS9PRGWqcjTp5-5vvrX/')).toBeNull()
@@ -51,18 +51,18 @@ describe('Watch & Auto-record', () => {
 
   it('parses Chaturbate target correctly', () => {
     const res1 = parseWatchTarget('visceratio')
-    expect(res1).toEqual({ platform: 'chaturbate', identifier: 'visceratio', clean: 'visceratio' })
+    expect(res1).toEqual({ platform: 'chaturbate', identifier: 'visceratio', clean: 'visceratio', explicitPlatform: false })
 
     const res2 = parseWatchTarget('https://chaturbate.com/visceratio')
-    expect(res2).toEqual({ platform: 'chaturbate', identifier: 'visceratio', clean: 'visceratio' })
+    expect(res2).toEqual({ platform: 'chaturbate', identifier: 'visceratio', clean: 'visceratio', explicitPlatform: true })
   })
 
   it('parses Stripchat target correctly', () => {
     const res1 = parseWatchTarget('https://stripchat.com/TUNDEROSE1')
-    expect(res1).toEqual({ platform: 'stripchat', identifier: 'tunderose1', clean: 'https://stripchat.com/tunderose1' })
+    expect(res1).toEqual({ platform: 'stripchat', identifier: 'tunderose1', clean: 'https://stripchat.com/tunderose1', explicitPlatform: true })
 
     const res2 = parseWatchTarget('stripchat_TUNDEROSE1')
-    expect(res2).toEqual({ platform: 'stripchat', identifier: 'tunderose1', clean: 'https://stripchat.com/tunderose1' })
+    expect(res2).toEqual({ platform: 'stripchat', identifier: 'tunderose1', clean: 'https://stripchat.com/tunderose1', explicitPlatform: true })
   })
 
   it('adds, lists and removes watch targets', async () => {
@@ -87,6 +87,28 @@ describe('Watch & Auto-record', () => {
 
     const listAfter = await listUserWatchTargets(12345, store)
     expect(listAfter.length).toBe(0)
+  })
+
+  it('removing an explicit-platform target keeps same-name watches on other platforms', async () => {
+    await addWatchTarget(12345, 'samename', store) // bare name defaults to chaturbate
+    await addWatchTarget(12345, 'stripchat_samename', store)
+    let list = await listUserWatchTargets(12345, store)
+    expect(list.length).toBe(2)
+
+    // Explicit platform removal must only touch that platform's watch
+    const rem = await removeWatchTarget(12345, 'stripchat_samename', store)
+    expect(rem.ok).toBe(true)
+    expect(rem.count).toBe(1)
+    list = await listUserWatchTargets(12345, store)
+    expect(list.length).toBe(1)
+    expect(list[0].platform).toBe('chaturbate')
+
+    // A bare name still removes every platform's entry with that name
+    await addWatchTarget(12345, '@samename', store)
+    const remAll = await removeWatchTarget(12345, 'samename', store)
+    expect(remAll.count).toBe(2)
+    list = await listUserWatchTargets(12345, store)
+    expect(list.length).toBe(0)
   })
 
   it('manages watch lock keys and clears locks properly', async () => {
