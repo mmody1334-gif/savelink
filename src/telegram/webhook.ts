@@ -3335,11 +3335,13 @@ async function handleRecordCommand(
         `⏳ <b>Status:</b> Recording in background...\n` +
         `💡 You can turn off your device. Video will be uploaded and link sent when done.`) + resumedNote
 
-    const stopTarget = model.length > 30 ? model.slice(0, 30) : model
+    // Byte-safe like the other recording buttons: callback_data is capped at 64 bytes.
+    const stopCb = safeCallbackData('rec|stop|', model)
+    const statCb = safeCallbackData('rec|stat|', model)
     const kb: InlineKeyboard = {
       inline_keyboard: [
-        [{ text: lang === 'ar' ? '⏹️ إيقاف وحفظ التسجيل الآن' : '⏹️ Stop & Save Now', callback_data: `rec|stop|${stopTarget}` }],
-        [{ text: lang === 'ar' ? '🔄 تحديث حالة التسجيل' : '🔄 Refresh Status', callback_data: `rec|stat|${stopTarget}` }],
+        [{ text: lang === 'ar' ? '⏹️ إيقاف وحفظ التسجيل الآن' : '⏹️ Stop & Save Now', callback_data: stopCb }],
+        [{ text: lang === 'ar' ? '🔄 تحديث حالة التسجيل' : '🔄 Refresh Status', callback_data: statCb }],
       ],
     }
 
