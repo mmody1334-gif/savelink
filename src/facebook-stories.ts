@@ -1,7 +1,25 @@
 import { EngineError } from './errors'
 import { decodeEscapes, fetchText } from './http'
 import { fbHeaders } from './facebook-profile'
+import { extractFbDtsg, fetchStoryBucketMedia } from './facebook-graphql'
 import type { Env, MediaItem } from './types'
+
+/**
+ * The stories/highlights pages are now JS shells with no media in the HTML.
+ * The real cards come from the stories viewer's GraphQL bucket query, so try
+ * that first (using the fb_dtsg token from the shell page) and only fall back
+ * to scraping the HTML when the GraphQL path yields nothing.
+ */
+async function fetchBucketViaGraphql(bucketId: string, html: string, env: Env): Promise<MediaItem[]> {
+  if (!env.FB_COOKIE) return []
+  const dtsg = extractFbDtsg(html)
+  if (!dtsg) return []
+  try {
+    return await fetchStoryBucketMedia(bucketId, dtsg, env)
+  } catch {
+    return []
+  }
+}
 
 const FB_REFERER = 'https://www.facebook.com/'
 
@@ -118,7 +136,8 @@ export async function fetchFacebookStories(
     )
   }
 
-  const items = extractStoryMediaFromHtml(html)
+  const graphqlItems = await fetchBucketViaGraphql(bucketIdOrUserId, html, env)
+  const items = graphqlItems.length ? graphqlItems : extractStoryMediaFromHtml(html)
   const name =
     html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i)?.[1] ||
     html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]
@@ -161,7 +180,8 @@ export async function fetchFacebookHighlights(
     )
   }
 
-  const items = extractStoryMediaFromHtml(html)
+  const graphqlItems = await fetchBucketViaGraphql(highlightId, html, env)
+  const items = graphqlItems.length ? graphqlItems : extractStoryMediaFromHtml(html)
   const title =
     html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i)?.[1] ||
     html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]
