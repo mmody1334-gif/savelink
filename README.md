@@ -29,7 +29,7 @@ Every engine is isolated: a timeout or a 403 only advances the chain. `ENGINE_OR
 | Platform | Native (no setup) | Notes |
 | --- | --- | --- |
 | TikTok | ✅ works | tikwm returns watermark-free MP4 + the original MP3 track |
-| Instagram post/reel | ⚠️ public reels/posts | anonymous API is 403; the embed page usually works. Private/age-gated posts need `IG_COOKIE` or the sidecar |
+| Instagram post/reel | ⚠️ photo posts only | anonymous API is 401/403 and embeds no longer carry the video file, so reels need `IG_COOKIE`, the sidecar or cobalt; photo posts still download natively |
 | Instagram profile (DP + photos) | ✅ works | avatar from the public embed; recent photos from each post's signed `display_url` (original resolution). HD avatar + full archive need `IG_COOKIE` — see [docs/instagram-profile.md](docs/instagram-profile.md) |
 | Facebook | ✅ public videos/reels | public video plugin page; private posts need `FB_COOKIE` or the sidecar |
 | Pinterest | ✅ video pins | parses the pin's `video_list` (720p/1080p MP4) |
