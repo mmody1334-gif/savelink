@@ -18,6 +18,15 @@ import { sha256Hex } from '../src/sign'
 import { getStore } from '../src/store'
 import type { Env } from '../src/types'
 
+let lastPendingWebhook: Promise<unknown> | undefined
+function captureWaitUntil(): any {
+  return { waitUntil: (p: Promise<unknown>) => { lastPendingWebhook = p } }
+}
+async function flushWebhook(): Promise<void> {
+  await lastPendingWebhook
+  lastPendingWebhook = undefined
+}
+
 const BOT_TOKEN = '999:test-bot-token'
 const WEBHOOK_SECRET = 'test-webhook-secret'
 const SIGNING_SECRET = 'test-signing-secret'
@@ -253,7 +262,8 @@ describe('Telegram /archive and /stop archive integration', () => {
         },
       }),
     })
-    const res1 = await worker.fetch(archiveReq, env, { waitUntil: () => {} } as any)
+    const res1 = await worker.fetch(archiveReq, env, captureWaitUntil())
+    await flushWebhook()
     expect(res1.status).toBe(200)
 
     const archiveSend = tgCalls.find((c) => c.method === 'sendMessage')
@@ -275,7 +285,8 @@ describe('Telegram /archive and /stop archive integration', () => {
         },
       }),
     })
-    const res2 = await worker.fetch(stopReq, env, { waitUntil: () => {} } as any)
+    const res2 = await worker.fetch(stopReq, env, captureWaitUntil())
+    await flushWebhook()
     expect(res2.status).toBe(200)
 
     const stopEdit = tgCalls.find((c) => c.method === 'editMessageText')
@@ -412,8 +423,9 @@ describe('Telegram /archive and /stop archive integration', () => {
         }),
       }),
       env,
-      { waitUntil: () => {} } as any,
+      captureWaitUntil(),
     )
+    await flushWebhook()
     const firstMsg = tgCalls.find((c) => c.method === 'sendMessage')
     const kb1 = JSON.stringify(firstMsg?.body.reply_markup)
     expect(kb1).toContain('arch|p|0|chaturbate')
@@ -437,8 +449,9 @@ describe('Telegram /archive and /stop archive integration', () => {
         }),
       }),
       env,
-      { waitUntil: () => {} } as any,
+      captureWaitUntil(),
     )
+    await flushWebhook()
     expect(await listArchiveEntries(store, 736161596)).toHaveLength(1)
 
     // 3. Long Arabic query respects Telegram 64-byte UTF-8 callback_data limit
@@ -457,8 +470,9 @@ describe('Telegram /archive and /stop archive integration', () => {
         }),
       }),
       env,
-      { waitUntil: () => {} } as any,
+      captureWaitUntil(),
     )
+    await flushWebhook()
     const arSend = tgCalls.filter((c) => c.method === 'sendMessage').pop()
     const enc = new TextEncoder()
     for (const row of arSend?.body.reply_markup?.inline_keyboard || []) {
@@ -485,8 +499,9 @@ describe('Telegram /archive and /stop archive integration', () => {
         }),
       }),
       env,
-      { waitUntil: () => {} } as any,
+      captureWaitUntil(),
     )
+    await flushWebhook()
     const clearPrompt = tgCalls.filter((c) => c.method === 'sendMessage').pop()
     expect(JSON.stringify(clearPrompt?.body.reply_markup)).toContain('arch|clr_yes')
 
@@ -505,8 +520,9 @@ describe('Telegram /archive and /stop archive integration', () => {
         }),
       }),
       env,
-      { waitUntil: () => {} } as any,
+      captureWaitUntil(),
     )
+    await flushWebhook()
     expect(await listArchiveEntries(store, 736161596)).toHaveLength(0)
     expect(await listArchiveEntries(store, 888)).toHaveLength(1)
     expect(await clearArchiveEntries(store, 736161596)).toBe(0)
