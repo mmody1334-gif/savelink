@@ -126,7 +126,8 @@ export async function extractInstagram(input: ResolveInput, env: Env): Promise<M
     }
   }
 
-  // Public embed page. Works for many reels without a session cookie.
+  // Public embed page. Photo posts still come through here; Instagram no
+  // longer ships video_url in anonymous embeds, so reels rarely resolve here.
   try {
     const embedUrl = `https://www.instagram.com/${target.kind}/${target.shortcode}/embed/captioned/`
     const html = await fetchText(
@@ -135,8 +136,17 @@ export async function extractInstagram(input: ResolveInput, env: Env): Promise<M
       15_000,
     )
     const result = fromEmbedHtml(html, input.url)
-    if (result) return result
-    failures.push('embed: no media in page')
+    if (result) {
+      // A reel/tv link always points to a video. When the embed page only
+      // yields the poster image, video extraction failed: report it so the
+      // engine chain moves on (cobalt/sidecar) instead of showing a
+      // misleading "Photos (1)" picker for a video link.
+      const expectsVideo = target.kind === 'reel' || target.kind === 'tv'
+      if (!expectsVideo || result.items.some((item) => item.kind === 'video')) return result
+      failures.push('embed: poster image only, no video in page')
+    } else {
+      failures.push('embed: no media in page')
+    }
   } catch (error) {
     failures.push(`embed: ${(error as Error).message}`)
   }
@@ -146,3 +156,4 @@ export async function extractInstagram(input: ResolveInput, env: Env): Promise<M
     'instagram',
   )
 }
+
