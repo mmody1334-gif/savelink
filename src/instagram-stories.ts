@@ -196,16 +196,26 @@ export async function fetchActiveStories(username: string, env: Env): Promise<In
 
   // A hosted Instagram API keeps its own sessions/proxies: it is the only
   // source that works when there is no usable cookie and Workers are blocked.
+  // It is also billed and rate-limited, so a failure must not be final when a
+  // session cookie (or sidecar) can still answer: fall through on error.
+  let apiError: Error | undefined
   if (instagramApi(env)) {
-    const stories = await apiStories(username, env)
-    return { username, items: stories.items, updatedAt: stories.updatedAt }
+    try {
+      const stories = await apiStories(username, env)
+      return { username, items: stories.items, updatedAt: stories.updatedAt }
+    } catch (error) {
+      apiError = error as Error
+    }
   }
 
   const helper = await sidecarStoriesResult(username, env)
   if (helper.result) return helper.result
   if (helper.error && !env.IG_COOKIE) throw helper.error
 
-  requireSession(env, 'Stories')
+  if (!env.IG_COOKIE) {
+    if (apiError) throw apiError
+    requireSession(env, 'Stories')
+  }
   const userId = await resolveUserId(username, env)
 
   let reel: any
@@ -244,15 +254,25 @@ export async function fetchActiveStories(username: string, env: Env): Promise<In
 export async function fetchHighlights(username: string, env: Env): Promise<InstagramHighlight[]> {
   requireUsername(username)
 
+  // Hosted API first, but never final: a provider error falls back to the
+  // sidecar and the session cookie (same contract as fetchActiveStories).
+  let apiError: Error | undefined
   if (instagramApi(env)) {
-    return await apiHighlights(username, env)
+    try {
+      return await apiHighlights(username, env)
+    } catch (error) {
+      apiError = error as Error
+    }
   }
 
   const helper = await sidecarHighlightsResult(username, env)
   if (helper.result) return helper.result
   if (helper.error && !env.IG_COOKIE) throw helper.error
 
-  requireSession(env, 'Highlights')
+  if (!env.IG_COOKIE) {
+    if (apiError) throw apiError
+    requireSession(env, 'Highlights')
+  }
   const userId = await resolveUserId(username, env)
 
   // 1. Modern Web GraphQL query (PolarisProfileStoryHighlightsTrayContentQuery)
@@ -321,7 +341,11 @@ export async function fetchHighlightItems(
   username?: string,
 ): Promise<{ items: MediaItem[]; title?: string }> {
   if (instagramApi(env)) {
-    return await apiHighlightItems(highlightId, env, username)
+    try {
+      return await apiHighlightItems(highlightId, env, username)
+    } catch {
+      /* fall through to the sidecar or the session cookie */
+    }
   }
 
   if (instagramSidecar(env)) {
@@ -369,4 +393,4 @@ export async function fetchHighlightItems(
     items: reelItems(Array.isArray(reel?.items) ? reel.items : []),
     title: typeof reel?.title === 'string' ? reel.title : undefined,
   }
-}
+                 }
