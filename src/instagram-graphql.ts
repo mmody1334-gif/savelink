@@ -111,6 +111,18 @@ export async function queryInstagramGraphQL<T>(options: {
     throw new EngineError(`Instagram GraphQL responded HTTP ${response.status}`, 'instagram-graphql')
   }
 
+  // A session Instagram does not trust is redirected to the login page, which
+  // arrives as HTTP 200 text/html. Parsing that as JSON used to throw a bare
+  // SyntaxError; name it so logs and fallbacks see the real cause.
+  const contentType = response.headers?.get?.('content-type') || ''
+  if (contentType.includes('text/html')) {
+    throw new EngineError(
+      'Instagram GraphQL answered with a page instead of JSON (login wall). The IG_COOKIE may be expired or blocked from this server.',
+      'instagram-graphql',
+      false,
+    )
+  }
+
   const json = (await response.json()) as any
   if (!json?.data && json?.errors?.length) {
     const msg = json.errors.map((e: any) => e.message || JSON.stringify(e)).join('; ')
