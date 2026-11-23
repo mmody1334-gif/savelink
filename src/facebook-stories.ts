@@ -10,13 +10,12 @@ import type { Env, MediaItem } from './types'
  * that first (using the fb_dtsg token from the shell page) and only fall back
  * to scraping the HTML when the GraphQL path yields nothing.
  */
-async function fetchBucketViaGraphql(bucketId: string, html: string, env: Env): Promise<MediaItem[]> {
-  if (!env.FB_COOKIE) return []
-  const dtsg = extractFbDtsg(html)
-  if (!dtsg) return []
+async function fetchBucketViaGraphql(bucketId: string, dtsg: string | undefined, env: Env): Promise<MediaItem[]> {
+  if (!env.FB_COOKIE || !dtsg) return []
   try {
     return await fetchStoryBucketMedia(bucketId, dtsg, env)
-  } catch {
+  } catch (error) {
+    console.warn('[fb] story bucket GraphQL failed:', (error as Error).message)
     return []
   }
 }
@@ -107,6 +106,7 @@ export function extractStoryMediaFromHtml(html: string): MediaItem[] {
 export async function fetchFacebookStories(
   bucketIdOrUserId: string,
   env: Env,
+  opts: { dtsg?: string } = {},
 ): Promise<FacebookStoriesResult> {
   if (!env.FB_COOKIE) {
     throw new EngineError(
@@ -114,6 +114,14 @@ export async function fetchFacebookStories(
       'facebook-stories',
       false,
     )
+  }
+
+  // Fast path: a session token borrowed from the profile page lets us skip
+  // the stories shell page, which Facebook serves as a 400 error page to
+  // some datacenter IPs even when the session itself is valid.
+  if (opts.dtsg) {
+    const items = await fetchBucketViaGraphql(bucketIdOrUserId, opts.dtsg, env)
+    if (items.length) return { items }
   }
 
   const url = `https://www.facebook.com/stories/${bucketIdOrUserId}/`
@@ -136,7 +144,7 @@ export async function fetchFacebookStories(
     )
   }
 
-  const graphqlItems = await fetchBucketViaGraphql(bucketIdOrUserId, html, env)
+  const graphqlItems = await fetchBucketViaGraphql(bucketIdOrUserId, extractFbDtsg(html), env)
   const items = graphqlItems.length ? graphqlItems : extractStoryMediaFromHtml(html)
   const name =
     html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i)?.[1] ||
@@ -151,6 +159,7 @@ export async function fetchFacebookStories(
 export async function fetchFacebookHighlights(
   highlightId: string,
   env: Env,
+  opts: { dtsg?: string } = {},
 ): Promise<FacebookHighlightsResult> {
   if (!env.FB_COOKIE) {
     throw new EngineError(
@@ -158,6 +167,13 @@ export async function fetchFacebookHighlights(
       'facebook-highlights',
       false,
     )
+  }
+
+  // Same fast path as fetchFacebookStories: skip the stories shell page when
+  // the caller already holds a session token from the profile page.
+  if (opts.dtsg) {
+    const items = await fetchBucketViaGraphql(highlightId, opts.dtsg, env)
+    if (items.length) return { items }
   }
 
   const url = `https://www.facebook.com/stories/highlights/${highlightId}/`
@@ -180,7 +196,7 @@ export async function fetchFacebookHighlights(
     )
   }
 
-  const graphqlItems = await fetchBucketViaGraphql(highlightId, html, env)
+  const graphqlItems = await fetchBucketViaGraphql(highlightId, extractFbDtsg(html), env)
   const items = graphqlItems.length ? graphqlItems : extractStoryMediaFromHtml(html)
   const title =
     html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i)?.[1] ||
