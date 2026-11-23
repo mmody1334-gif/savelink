@@ -15,6 +15,8 @@ export interface FacebookProfileInfo {
   highlightId?: string
   /** every highlight collection id found on the profile, in page order */
   highlightIds?: string[]
+  /** fb_dtsg session token lifted from the profile page; lets story/highlight fetches skip the stories shell page */
+  dtsg?: string
 }
 
 export interface FacebookProfileResult {
@@ -252,15 +254,16 @@ export async function resolveFacebookProfile(input: {
   // the web app loads it through a deferred GraphQL tile query. When the HTML
   // gives us nothing, replay that query with the session cookie so highlight
   // collections are still discovered.
+  const dtsg = extractFbDtsg(html)
   if (!highlightIds.length && userId && env.FB_COOKIE) {
     try {
-      const dtsg = extractFbDtsg(html)
       if (dtsg) {
         const collections = await fetchFacebookHighlightCollections(userId, dtsg, env)
         for (const c of collections) addHighlightId(c.id)
       }
-    } catch {
+    } catch (error) {
       // discovery fallback must never break the profile flow
+      console.warn('[fb] highlight discovery failed:', (error as Error).message)
     }
   }
   const highlightId = highlightIds[0]
@@ -286,6 +289,7 @@ export async function resolveFacebookProfile(input: {
       storyBucketId,
       highlightId,
       highlightIds,
+      dtsg,
     },
     items: [avatarItem, ...photos],
     photos,
