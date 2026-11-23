@@ -149,6 +149,8 @@ interface StoredMedia {
     highlightIds?: string[]
     photoCount: number
     hd: boolean
+    /** fb_dtsg session token from the profile page; lets story/highlight fetches skip the stories shell page */
+    dtsg?: string
   }
   /** full-archive pagination state (only when IG_COOKIE is configured) */
   archive?: {
@@ -589,15 +591,17 @@ async function handleCommand(
           return
         }
         let targetId = ''
+        let profileDtsg: string | undefined
         if (fbTarget) {
           try {
             const profile = await resolveFacebookProfile({ target: fbTarget.url, env })
             targetId = profile.info.storyBucketId || profile.info.userId || fbTarget.value
+            profileDtsg = profile.info.dtsg
           } catch {
             targetId = fbTarget.value
           }
         }
-        await showFacebookHighlights(tg, chatId, status.message_id, [targetId], lang, env)
+        await showFacebookHighlights(tg, chatId, status.message_id, [targetId], lang, env, undefined, { dtsg: profileDtsg })
         return
       }
 
@@ -4066,7 +4070,6 @@ async function handleLink(
     const key = shortKey()
     const stored: StoredMedia = { result, items, lang }
     await store.put(`m:${key}`, JSON.stringify(stored), 3600)
-
     await tg.safeEdit('editMessageText', {
       chat_id: chatId,
       message_id: status.message_id,
@@ -4249,6 +4252,7 @@ async function handleFacebookProfile(
         highlightIds: profile.info.highlightIds,
         photoCount: profile.photoCount,
         hd: profile.info.hd,
+        dtsg: profile.info.dtsg,
       },
     }
     await store.put(`m:${key}`, JSON.stringify(stored), 3600)
@@ -4643,6 +4647,7 @@ async function showFacebookStories(
   lang: Lang,
   env: Env,
   back?: () => Promise<InlineKeyboard | undefined>,
+  opts: { dtsg?: string } = {},
 ): Promise<void> {
   if (!env.FB_COOKIE) {
     await tg.safeEdit('editMessageText', {
@@ -4656,7 +4661,7 @@ async function showFacebookStories(
   }
 
   try {
-    const stories = await fetchFacebookStories(targetId, env)
+    const stories = await fetchFacebookStories(targetId, env, opts)
     const items = stories.items.slice(0, REEL_LIMIT)
 
     if (!items.length) {
@@ -4708,6 +4713,7 @@ async function showFacebookHighlights(
   lang: Lang,
   env: Env,
   back?: () => Promise<InlineKeyboard | undefined>,
+  opts: { dtsg?: string } = {},
 ): Promise<void> {
   if (!env.FB_COOKIE) {
     await tg.safeEdit('editMessageText', {
@@ -4730,7 +4736,7 @@ async function showFacebookHighlights(
     let firstError: unknown
     for (const id of highlightIds.slice(0, 6)) {
       try {
-        const hl = await fetchFacebookHighlights(id, env)
+        const hl = await fetchFacebookHighlights(id, env, opts)
         if (!title && hl.title) title = hl.title
         for (const item of hl.items) {
           if (!seenUrls.has(item.url)) {
@@ -5505,7 +5511,7 @@ async function handleCallback(
         return
       }
       await answer(tg, query?.id, t(lang, 'storiesSending'))
-      await showFacebookStories(tg, chatId, messageId, targetId, lang, env, back)
+      await showFacebookStories(tg, chatId, messageId, targetId, lang, env, back, { dtsg: stored.fbProfile?.dtsg })
       return
     }
 
@@ -5527,7 +5533,7 @@ async function handleCallback(
         return
       }
       await answer(tg, query?.id, t(lang, 'highlightsSending'))
-      await showFacebookHighlights(tg, chatId, messageId, highlightIds, lang, env, back)
+      await showFacebookHighlights(tg, chatId, messageId, highlightIds, lang, env, back, { dtsg: stored.fbProfile?.dtsg })
       return
     }
   }
