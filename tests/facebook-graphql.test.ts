@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   extractFbDtsg,
   parseHighlightCollections,
   parseStoryBucketMedia,
 } from '../src/facebook-graphql'
+import { fetchFacebookHighlights } from '../src/facebook-stories'
 
 const tileResponse = JSON.stringify({
   data: {
@@ -107,5 +108,40 @@ describe('facebook graphql helpers', () => {
       hasNextPage: false,
       endCursor: undefined,
     })
+  })
+})
+
+describe('fetchFacebookHighlights session-token fast path', () => {
+  const env = { FB_COOKIE: 'c_user=123; xs=fake' } as any
+
+  it('skips the stories shell page and posts GraphQL directly when dtsg is provided', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', async (input: any, init?: any) => {
+      calls.push(`${init?.method || 'GET'} ${String(input)}`)
+      return new Response(bucketResponse, { status: 200 })
+    })
+    try {
+      const res = await fetchFacebookHighlights('1431061792450191', env, { dtsg: 'TOKEN123' })
+      expect(res.items).toHaveLength(2)
+      expect(calls).toHaveLength(1)
+      expect(calls[0]).toBe('POST https://www.facebook.com/api/graphql/')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('still loads the stories shell page when no dtsg is provided', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', async (input: any, init?: any) => {
+      calls.push(`${init?.method || 'GET'} ${String(input)}`)
+      return new Response('<html><body>no media here</body></html>', { status: 200 })
+    })
+    try {
+      const res = await fetchFacebookHighlights('1431061792450191', env)
+      expect(res.items).toHaveLength(0)
+      expect(calls[0]).toBe('GET https://www.facebook.com/stories/highlights/1431061792450191/')
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
