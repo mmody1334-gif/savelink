@@ -4070,6 +4070,7 @@ async function handleLink(
     const key = shortKey()
     const stored: StoredMedia = { result, items, lang }
     await store.put(`m:${key}`, JSON.stringify(stored), 3600)
+
     await tg.safeEdit('editMessageText', {
       chat_id: chatId,
       message_id: status.message_id,
