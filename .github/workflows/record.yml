@@ -25,6 +25,10 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
     steps:
+      - name: Mask chat id
+        run: |
+          echo "::add-mask::$(jq -r '.inputs.chat_id' "$GITHUB_EVENT_PATH")"
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -45,9 +49,14 @@ jobs:
 
       - name: Record Stream
         run: |
-          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.watch_mode }}"
+          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
+          CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          WATCH="$(jq -r '.inputs.watch_mode // empty' "$GITHUB_EVENT_PATH")"
+          python recorder.py "$MODEL" "$CHAT" "$WATCH"
 
       - name: Backup Uploader (Always Runs)
         if: always()
         run: |
-          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}"
+          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
+          CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          python uploader.py "$MODEL" "$CHAT"
