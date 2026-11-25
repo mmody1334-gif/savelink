@@ -2,3 +2,6 @@ yt-dlp>=2025.1.15
 requests>=2.31.0
 curl-cffi>=0.7.0
 streamlink>=8.0.0
+fastapi
+uvicorn
+pydantic
