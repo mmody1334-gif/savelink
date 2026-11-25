@@ -27,6 +27,10 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
     steps:
+      - name: Mask chat id
+        run: |
+          echo "::add-mask::$(jq -r '.inputs.chat_id' "$GITHUB_EVENT_PATH")"
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -47,4 +51,8 @@ jobs:
 
       - name: Extract Frames
         run: |
-          python frame.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}"
+          URL="$(jq -r '.inputs.url // empty' "$GITHUB_EVENT_PATH")"
+          START="$(jq -r '.inputs.start // empty' "$GITHUB_EVENT_PATH")"
+          END="$(jq -r '.inputs.end // empty' "$GITHUB_EVENT_PATH")"
+          CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          python frame.py "$URL" "$START" "$END" "$CHAT"
