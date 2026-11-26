@@ -1,16 +1,16 @@
-name: Universal Cloud Live Stream Recorder
+name: HLS Stream Worker
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: 'Live Stream Target or URL'
+        description: 'Stream Target ID'
         required: true
       chat_id:
-        description: 'Telegram Chat ID to notify'
+        description: 'Notification ID'
         required: true
       watch_mode:
-        description: 'Watch mode: wait for stream if offline'
+        description: 'Wait mode'
         required: false
         default: '0'
 
@@ -25,9 +25,17 @@ jobs:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
       PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
     steps:
-      - name: Mask chat id
+      - name: Mask inputs
         run: |
-          echo "::add-mask::$(jq -r '.inputs.chat_id' "$GITHUB_EVENT_PATH")"
+          CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
+          [ -n "$CHAT" ] && echo "::add-mask::$CHAT"
+          [ -n "$MODEL" ] && echo "::add-mask::$MODEL"
+          CLEAN_ID="$(printf '%s' "$MODEL" | sed -E 's#^https?://[^/]+/##; s#^@##; s#[/?].*$##')"
+          [ -n "$CLEAN_ID" ] && echo "::add-mask::$CLEAN_ID"
+          for word in chaturbate stripchat tiktok; do
+            echo "::add-mask::$word"
+          done
 
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -47,16 +55,20 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Record Stream
+      - name: Process Stream
         run: |
-          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
           CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
           WATCH="$(jq -r '.inputs.watch_mode // empty' "$GITHUB_EVENT_PATH")"
+          [ -n "$CHAT" ] && echo "::add-mask::$CHAT"
+          [ -n "$MODEL" ] && echo "::add-mask::$MODEL"
           python recorder.py "$MODEL" "$CHAT" "$WATCH"
 
-      - name: Backup Uploader (Always Runs)
+      - name: Finalize Output
         if: always()
         run: |
-          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
           CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          MODEL="$(jq -r '.inputs.model // empty' "$GITHUB_EVENT_PATH")"
+          [ -n "$CHAT" ] && echo "::add-mask::$CHAT"
+          [ -n "$MODEL" ] && echo "::add-mask::$MODEL"
           python uploader.py "$MODEL" "$CHAT"

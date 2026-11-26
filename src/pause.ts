@@ -71,7 +71,7 @@ export function canControlPause(env: Env, userId?: number): boolean {
 export async function cancelAllGitHubRuns(env: Env): Promise<number> {
   const token = env.GITHUB_TOKEN
   if (!token) return 0
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   const headers = {
     Authorization: `token ${token}`,
     Accept: 'application/vnd.github.v3+json',
@@ -100,7 +100,7 @@ export async function cancelAllGitHubRuns(env: Env): Promise<number> {
 export async function stopRecorderGitHubRuns(env: Env): Promise<{ running: number; cancelledQueued: number }> {
   const token = env.GITHUB_TOKEN
   if (!token) return { running: 0, cancelledQueued: 0 }
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   const headers = {
     Authorization: `token ${token}`,
     Accept: 'application/vnd.github.v3+json',

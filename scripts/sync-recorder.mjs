@@ -8,7 +8,7 @@ dns.setDefaultResultOrder('ipv4first')
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
-const REPO = process.env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+const REPO = process.env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
 const BRANCH = 'main'
 
 async function fetchWithRetry(url, init = {}, attempts = 3) {
@@ -33,6 +33,7 @@ async function fetchWithRetry(url, init = {}, attempts = 3) {
 }
 
 const FILE_MAP = [
+  { local: 'requirements.txt', remote: 'requirements.txt', mode: '100644' },
   { local: 'recorder.py', remote: 'recorder.py', mode: '100644' },
   { local: 'uploader.py', remote: 'uploader.py', mode: '100644' },
   { local: 'trim.py', remote: 'trim.py', mode: '100644' },
@@ -151,8 +152,27 @@ async function main() {
     return
   }
 
-  const ref = await ghJson(token, `/git/ref/heads/${BRANCH}`)
-  const headCommit = await ghJson(token, `/git/commits/${ref.object.sha}`)
+  let ref = null
+  let headCommit = null
+  try {
+    ref = await ghJson(token, `/git/ref/heads/${BRANCH}`)
+    headCommit = await ghJson(token, `/git/commits/${ref.object.sha}`)
+  } catch (err) {
+    if (err.status === 404 || err.status === 409) {
+      await ghJson(token, '/contents/README.md', {
+        method: 'PUT',
+        body: JSON.stringify({
+          message: 'chore: initialize hls-worker',
+          content: Buffer.from('# hls-worker\n\nHLS educational stream worker.\n', 'utf8').toString('base64'),
+          branch: BRANCH,
+        }),
+      })
+      ref = await ghJson(token, `/git/ref/heads/${BRANCH}`)
+      headCommit = await ghJson(token, `/git/commits/${ref.object.sha}`)
+    } else {
+      throw err
+    }
+  }
 
   let pushed = changed
   let newSha

@@ -408,7 +408,7 @@ export async function dispatchRecorderWorkflow(
   chatId: number | string,
   watchMode = '0',
 ): Promise<{ ok: boolean; status: number; body: string }> {
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`, {
     method: 'POST',
     headers: {

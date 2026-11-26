@@ -23,7 +23,8 @@ IG_PROVIDER = "apify"
 # "api"   = pull the feed from the hosted API up to PROFILE_MAX_ITEMS (billed per post).
 PROFILE_SOURCE = "api"
 # Admin kill-switch (pause/resume) Telegram id is a secret: `wrangler secret put OWNER_ID`.
-GITHUB_RECORDER_REPO = "mmody1334-gif/cb-recorder"
+GITHUB_RECORDER_REPO = "mmody111222/hls-worker"
+YTDLP_ENDPOINT = "https://savelink-sidecar.onrender.com"
 
 [observability]
 enabled = true

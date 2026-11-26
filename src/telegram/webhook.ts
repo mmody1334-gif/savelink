@@ -1008,7 +1008,7 @@ async function handleTrimCommand(
 ): Promise<void> {
   const chatId = message.chat.id
   const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
 
   if (!token) {
     await tg.call('sendMessage', {
@@ -1210,7 +1210,7 @@ async function handleFrameCommand(
 ): Promise<void> {
   const chatId = message.chat.id
   const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
 
   if (!token) {
     await tg.call('sendMessage', {
@@ -2734,7 +2734,7 @@ async function triggerGitHubRecorder(
   env: Env,
 ): Promise<{ ok: boolean; error?: string }> {
   const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   if (!token) return { ok: false, error: 'No GITHUB_TOKEN configured' }
 
   const url = `https://api.github.com/repos/${repo}/actions/workflows/record.yml/dispatches`
@@ -2770,7 +2770,7 @@ export async function cancelGitHubRecorder(
   env: Env,
 ): Promise<{ ok: boolean; count?: number; error?: string }> {
   const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   if (!token) return { ok: false, error: 'No GITHUB_TOKEN configured' }
 
   const listRes = await fetch(`https://api.github.com/repos/${repo}/actions/runs?status=in_progress`, {
@@ -2802,7 +2802,7 @@ async function getGitHubRecorderRuns(
   env: Env,
 ): Promise<{ ok: boolean; activeCount: number; queuedCount: number }> {
   const token = env.GITHUB_TOKEN
-  const repo = env.GITHUB_RECORDER_REPO || 'mmody1334-gif/cb-recorder'
+  const repo = env.GITHUB_RECORDER_REPO || 'mmody111222/hls-worker'
   if (!token) return { ok: false, activeCount: 0, queuedCount: 0 }
 
   try {

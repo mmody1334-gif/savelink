@@ -29,7 +29,10 @@ jobs:
     steps:
       - name: Mask chat id
         run: |
-          echo "::add-mask::$(jq -r '.inputs.chat_id' "$GITHUB_EVENT_PATH")"
+          CHAT="$(jq -r '.inputs.chat_id // empty' "$GITHUB_EVENT_PATH")"
+          URL="$(jq -r '.inputs.url // empty' "$GITHUB_EVENT_PATH")"
+          [ -n "$CHAT" ] && echo "::add-mask::$CHAT"
+          [ -n "$URL" ] && echo "::add-mask::$URL"
 
       - name: Checkout Code
         uses: actions/checkout@v4
